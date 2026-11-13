@@ -1,0 +1,2252 @@
+#!/usr/bin/env python3
+"""ezproton: back up and sync folders with Proton Drive, using Proton's official CLI.
+
+Unofficial; not made by or affiliated with Proton. See README.md for how it works.
+Only Python's standard library is used.
+"""
+
+import concurrent.futures
+import datetime
+import errno
+import fcntl
+import fnmatch
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+from dataclasses import dataclass, field
+
+VERSION = "0.1.0"
+USAGE = """Usage:
+  ezproton backup  [PATH...] [--yes]
+  ezproton sync    [PATH...] [--yes]
+  ezproton check   [backup|sync] [PATH...]
+  ezproton preview [backup|sync] [PATH...] [--excluded]
+  ezproton last    [backup|sync] [PATH...] [--log]
+  ezproton undo last [backup|sync] [PATH...] [--yes]
+  ezproton edit    [backup|sync|exclude|settings] [--editor COMMAND]
+  ezproton --help | --version"""
+
+HELP = USAGE + """
+
+Back up and sync folders with Proton Drive, using Proton's official CLI
+(proton-drive). Unofficial: not made by or affiliated with Proton.
+
+Commands:
+  backup      Copy the folders listed in ~/.config/ezproton/backup to Drive
+              (one way: deletions on the computer are mirrored to Drive's trash)
+  sync        Two-way sync of the folder pairs in ~/.config/ezproton/sync
+  check       Show what's set up, without changing anything
+  preview     Dry run: list what backup or sync would do
+  last        Show how the last run of each folder or pair went
+  undo last   Reverse the last run, as far as possible
+  edit        Open a config file in an editor, and check it before saving
+
+Without backup or sync, check, preview, last and undo cover both. Without
+PATH, a command covers everything configured. PATH must be a configured
+backup folder or the laptop folder of a sync pair.
+
+Options:
+  --yes             Go past the deletion limit (backup, sync), or don't ask
+                    before undoing
+  --excluded        preview: also list every skipped path and why
+  --log             last: print the full output of the last run
+  --editor COMMAND  edit: the editor to use (default: $VISUAL, $EDITOR, then
+                    nvim, vim, nano or vi)
+  -h, --help        Show this help
+  --version         Show the version
+
+Files:
+  ~/.config/ezproton/backup     folders to back up:  PATH [: own|mirror]
+  ~/.config/ezproton/sync       folder pairs:  LAPTOP FOLDER : DRIVE FOLDER
+  ~/.config/ezproton/exclude    names to skip anywhere (wildcards work)
+  ~/.config/ezproton/settings   backup-root, separator, delete-limit
+  ~/.local/state/ezproton/      what ezproton remembers between runs
+
+Exit status:
+  0 success, 1 error, 2 partial (some items skipped or left for you),
+  3 stopped by the deletion limit (repeat with --yes)
+
+Environment:
+  NO_COLOR    Set to disable colors"""
+
+DRIVE_ROOT = "/my-files"
+TMP_NAME = ".ezproton-tmp"
+UPLOAD_WORKERS = 4
+LIST_WORKERS = 8
+HOSTNAME = os.uname().nodename
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "ezproton")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "ezproton")
+DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+CONFIG_FILES = ("backup", "sync", "exclude", "settings")
+
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+BOLD, DIM, RED, YELLOW, GREEN, RESET = (
+    ("\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[0m") if COLOR else ("",) * 6
+)
+
+OK, ERROR, PARTIAL, LIMIT = 0, 1, 2, 3
+
+
+class EzError(Exception):
+    """An error that stops the command, with an exit code."""
+
+    def __init__(self, message, code=ERROR):
+        super().__init__(message)
+        self.code = code
+
+
+class UsageError(EzError):
+    pass
+
+
+# --------------------------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------------------------
+
+
+def show(path):
+    """A local path with the home folder written as ~."""
+    if path == HOME:
+        return "~"
+    if path.startswith(HOME + os.sep):
+        return "~/" + path[len(HOME) + 1:]
+    return path
+
+
+def human(size):
+    size = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def plural(count, word):
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
+
+def ago(epoch):
+    seconds = time.time() - epoch
+    if seconds < 90:
+        return "just now"
+    if seconds < 90 * 60:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 48 * 3600:
+        return f"{int(seconds // 3600)} h ago"
+    return f"{int(seconds // 86400)} days ago"
+
+
+def when(epoch):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)) + f" ({ago(epoch)})"
+
+
+def warn(message):
+    print(f"{YELLOW}{message}{RESET}", file=sys.stderr)
+
+
+def sha1_of(path):
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def parse_time(text):
+    """Proton's ISO times, such as 2026-11-11T03:56:11.014Z, as epoch seconds."""
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def drive_join(base, *names):
+    path = base.rstrip("/")
+    for name in names:
+        if name:
+            path += "/" + name.replace("/", "\\/")
+    return path
+
+
+def rel_join(base, rel):
+    return os.path.join(base, rel) if rel else base
+
+
+def parent_rel(rel):
+    return os.path.dirname(rel)
+
+
+def is_under(rel, ancestor):
+    return ancestor == "" or rel == ancestor or rel.startswith(ancestor + "/")
+
+
+def atomic_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def ask(prompt, choices):
+    """Ask on the terminal until one of `choices` (or an empty answer for the first) is typed."""
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            return choices[0]
+        if answer == "":
+            return choices[0]
+        if answer in choices:
+            return answer
+
+
+# --------------------------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------------------------
+
+TEMPLATES = {
+    "backup": """# Folders (or files) to back up, one per line. Each goes to <backup root>/<its name>.
+# Optional mode after the separator:  own (default) = only trash what ezproton uploaded,
+#                                     mirror = make the Drive folder match exactly.
+# Examples:
+#   ~/Documents
+#   ~/Work : mirror
+""",
+    "sync": """# Folder pairs kept in two-way sync:  laptop folder : Drive folder
+# Drive folders must be inside /my-files.
+# Examples:
+#   ~/Music    : /my-files/Music
+#   ~/Pictures : /my-files/Photos/Laptop
+""",
+    "exclude": """# Names to skip anywhere inside backup folders and sync pairs. Wildcards work.
+# Examples:
+#   node_modules
+#   .venv
+#   *.iso
+""",
+    "settings": """# All settings are optional.
+# backup-root  = /my-files/Backups/<hostname>   # Drive folder that backups go into
+# separator    = :                              # separator used in the backup and sync files
+# delete-limit = 50                             # most deletions a run may make without --yes
+""",
+}
+
+
+def clean_lines(text):
+    """The useful lines of a config file as (line number, text): no Windows line endings, no
+    spaces around the text, no blank lines, no # comments, no repeats."""
+    seen, out = set(), []
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.rstrip("\r").strip()
+        if not line or line.startswith("#") or line in seen:
+            continue
+        seen.add(line)
+        out.append((number, line))
+    return out
+
+
+def split_fields(line, separator):
+    """Split on the separator, except where it's escaped with a backslash."""
+    fields, current, i = [], "", 0
+    while i < len(line):
+        if line.startswith("\\" + separator, i):
+            current += separator
+            i += len(separator) + 1
+        elif line.startswith(separator, i):
+            fields.append(current.strip())
+            current = ""
+            i += len(separator)
+        else:
+            current += line[i]
+            i += 1
+    fields.append(current.strip())
+    return fields
+
+
+def config_path(text):
+    """A config path: must start with / or ~/. Tidied without following symlinks."""
+    if text == "~" or text.startswith("~/"):
+        text = HOME + text[1:]
+    if not text.startswith("/"):
+        return None
+    return os.path.normpath(text)
+
+
+def clean_drive_path(text):
+    text = text.rstrip("/") if text != "/" else text
+    if not (text == DRIVE_ROOT or text.startswith(DRIVE_ROOT + "/")):
+        return None
+    if any(part in ("", ".", "..") for part in text.split("/")[1:]):
+        return None
+    return text
+
+
+@dataclass
+class BackupEntry:
+    local: str
+    name: str
+    mode: str
+    remote: str = ""
+    kind: str = "backup"
+
+    @property
+    def key(self):
+        return hashlib.sha1(self.local.encode()).hexdigest()[:16]
+
+
+@dataclass
+class SyncPair:
+    local: str
+    remote: str
+    kind: str = "sync"
+
+    @property
+    def name(self):
+        return os.path.basename(self.local)
+
+    @property
+    def key(self):
+        return hashlib.sha1(f"{self.local}\0{self.remote}".encode()).hexdigest()[:16]
+
+
+@dataclass
+class Config:
+    backup_root: str = ""
+    separator: str = ":"
+    delete_limit: int = 50
+    backups: list = field(default_factory=list)
+    pairs: list = field(default_factory=list)
+    excludes: list = field(default_factory=list)
+    problems: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+
+    def excluded_by(self, name):
+        for rule in self.excludes:
+            if fnmatch.fnmatchcase(name, rule):
+                return rule
+        return None
+
+
+def load_config(overrides=None):
+    """Read and check all config files. `overrides` replaces a file's text (used by edit)."""
+    overrides = overrides or {}
+    texts = {}
+    for name in CONFIG_FILES:
+        if name in overrides:
+            texts[name] = overrides[name]
+        else:
+            try:
+                with open(os.path.join(CONFIG_DIR, name)) as handle:
+                    texts[name] = handle.read()
+            except FileNotFoundError:
+                texts[name] = ""
+    config = Config(backup_root=f"{DRIVE_ROOT}/Backups/{HOSTNAME}")
+    problems = config.problems
+
+    # settings
+    for number, line in clean_lines(texts["settings"]):
+        where = f"settings line {number}"
+        if " #" in line:
+            line = line.split(" #", 1)[0].rstrip()
+        key, eq, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not eq:
+            problems.append(f"{where}: expected \"name = value\", got \"{line}\"")
+        elif key == "backup-root":
+            value = value.replace("<hostname>", HOSTNAME)
+            cleaned = clean_drive_path(value)
+            if cleaned is None:
+                problems.append(f"{where}: backup-root \"{value}\" must be a clean folder path inside {DRIVE_ROOT}")
+            else:
+                config.backup_root = cleaned
+        elif key == "separator":
+            if not value or any(c.isspace() for c in value) or any(c in value for c in "/~#\\"):
+                problems.append(f"{where}: separator \"{value}\" can't be empty, contain spaces, /, ~, # or \\")
+            else:
+                config.separator = value
+        elif key == "delete-limit":
+            if value.isdigit():
+                config.delete_limit = int(value)
+            else:
+                problems.append(f"{where}: delete-limit must be a whole number, got \"{value}\"")
+        else:
+            problems.append(f"{where}: unknown setting \"{key}\"")
+    if config.backup_root == DRIVE_ROOT:
+        problems.append(f"settings: backup-root can't be {DRIVE_ROOT} itself")
+
+    sep = config.separator
+
+    # exclude
+    for number, line in clean_lines(texts["exclude"]):
+        line = line.rstrip("/")
+        if "/" in line or not line:
+            config.warnings.append(
+                f"exclude line {number}: \"{line}\" contains /, but exclusions match names, not paths. Ignored."
+            )
+            continue
+        config.excludes.append(line)
+
+    # backup
+    names = {}
+    for number, line in clean_lines(texts["backup"]):
+        where = f"backup line {number}"
+        fields = split_fields(line, sep)
+        if len(fields) > 2:
+            problems.append(f"{where}: too many \"{sep}\" separators (write \\{sep} for a {sep} in a path)")
+            continue
+        local = config_path(fields[0])
+        if local is None:
+            problems.append(f"{where}: \"{fields[0]}\" is not an absolute path. Start it with / or ~/.")
+            continue
+        mode = fields[1].lower() if len(fields) == 2 else "own"
+        if mode not in ("own", "mirror"):
+            problems.append(f"{where}: unknown mode \"{fields[1]}\" (use own or mirror)")
+            continue
+        if local == "/":
+            problems.append(f"{where}: back up folders inside /, not / itself")
+            continue
+        if any(b.local == local for b in config.backups):
+            continue
+        name = os.path.basename(local)
+        if name in names:
+            problems.append(
+                f"{show(names[name])} and {show(local)} would both be backed up as \"{name}\". "
+                "Rename one of them, or list their parent folders instead."
+            )
+            continue
+        names[name] = local
+        config.backups.append(BackupEntry(local, name, mode, drive_join(config.backup_root, name)))
+
+    # sync
+    for number, line in clean_lines(texts["sync"]):
+        where = f"sync line {number}"
+        fields = split_fields(line, sep)
+        if len(fields) != 2:
+            problems.append(
+                f"{where}: expected \"laptop folder {sep} Drive folder\" "
+                f"(write \\{sep} for a {sep} inside a path)"
+            )
+            continue
+        local = config_path(fields[0])
+        if local is None:
+            problems.append(f"{where}: \"{fields[0]}\" is not an absolute path. Start it with / or ~/.")
+            continue
+        remote = clean_drive_path(fields[1])
+        if remote is None or remote == DRIVE_ROOT:
+            problems.append(f"{where}: \"{fields[1]}\" must be a clean folder path inside {DRIVE_ROOT}")
+            continue
+        if local == "/":
+            problems.append(f"{where}: sync folders inside /, not / itself")
+            continue
+        if any(p.local == local for p in config.pairs):
+            problems.append(f"{where}: {show(local)} is listed twice in sync")
+            continue
+        config.pairs.append(SyncPair(local, remote))
+
+    # overlaps
+    def nested(a, b):
+        return a == b or a.startswith(b.rstrip("/") + "/")
+
+    locals_ = [(e.local, f"backup {show(e.local)}") for e in config.backups] + [
+        (p.local, f"sync {show(p.local)}") for p in config.pairs
+    ]
+    for b in config.backups:
+        if any(p.local == b.local for p in config.pairs):
+            problems.append(f"{show(b.local)} is in both backup and sync. Choose one.")
+    for i, (a, label_a) in enumerate(locals_):
+        for j, (b, label_b) in enumerate(locals_):
+            if i != j and a != b and nested(a, b):
+                problems.append(f"{label_a} is inside {label_b}. Folders can't overlap.")
+    remotes = [(p.remote, f"Drive folder {p.remote}") for p in config.pairs]
+    for i, (a, label_a) in enumerate(remotes):
+        for j, (b, label_b) in enumerate(remotes):
+            if i != j and nested(a, b):
+                problems.append(f"{label_a} (sync) overlaps {label_b}. Drive folders can't overlap.")
+        if config.backups and (nested(a, config.backup_root) or nested(config.backup_root, a)):
+            problems.append(f"{label_a} (sync) overlaps the backup root {config.backup_root}.")
+    return config
+
+
+def config_or_die():
+    config = load_config()
+    for message in config.warnings:
+        warn(message)
+    if config.problems:
+        raise EzError("the config has problems, so nothing was done:\n  " + "\n  ".join(config.problems))
+    return config
+
+
+# --------------------------------------------------------------------------------------------
+# proton-drive
+# --------------------------------------------------------------------------------------------
+
+
+class DriveError(EzError):
+    pass
+
+
+@dataclass
+class Remote:
+    rel: str
+    type: str
+    uid: str
+    rev: str = ""
+    size: int = 0
+    sha1: str = ""
+    mtime: float = 0.0
+
+
+class Drive:
+    """Calls Proton's CLI. Every call is logged, so 'last --log' can show it."""
+
+    def __init__(self):
+        self.log = []
+
+    def run(self, *args, timeout=3600):
+        try:
+            result = subprocess.run(
+                ["proton-drive", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout
+            )
+        except FileNotFoundError:
+            raise DriveError("proton-drive is not installed. Install it with ezproton's install.sh, "
+                             "or from https://proton.me/download/drive/cli")
+        except subprocess.TimeoutExpired:
+            raise DriveError(f"proton-drive {' '.join(args[:2])} timed out")
+        self.log.append(f"$ proton-drive {shlex.join(args)}\n{result.stdout}{result.stderr}")
+        return result
+
+    @staticmethod
+    def not_found(result):
+        text = result.stdout + result.stderr
+        return "not found" in text.lower()
+
+    def check_login(self):
+        result = self.run("filesystem", "info", "--json", DRIVE_ROOT, timeout=120)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            raise DriveError(
+                "can't reach Proton Drive (not logged in, or offline). Log in with \"proton-drive auth login\", "
+                "and check the internet connection."
+                + (f"\n  {detail[-1]}" if detail else "")
+            )
+
+    def info(self, path):
+        result = self.run("filesystem", "info", "--json", path, timeout=300)
+        if result.returncode != 0:
+            if self.not_found(result):
+                return None
+            raise DriveError(f"can't read {path} on Drive: {(result.stderr or result.stdout).strip()}")
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            raise DriveError(f"unexpected output from proton-drive info {path}")
+
+    def list(self, path):
+        result = self.run("filesystem", "list", "--json", path, timeout=600)
+        if result.returncode != 0:
+            raise DriveError(f"can't list {path} on Drive: {(result.stderr or result.stdout).strip()}")
+        try:
+            return json.loads(result.stdout or "[]")
+        except ValueError:
+            raise DriveError(f"unexpected output from proton-drive list {path}")
+
+    def create_folder(self, parent, name):
+        result = self.run("filesystem", "create-folder", parent, name, timeout=300)
+        if result.returncode != 0 and "already exists" not in (result.stdout + result.stderr):
+            raise DriveError(f"can't create {drive_join(parent, name)} on Drive: {(result.stderr or result.stdout).strip()}")
+
+    def mkdirs(self, path):
+        """Make sure a Drive folder exists, creating each missing level."""
+        if self.info(path) is not None:
+            return False
+        parts = path[len(DRIVE_ROOT) + 1:].split("/")
+        current = DRIVE_ROOT
+        for part in parts:
+            target = drive_join(current, part)
+            if self.info(target) is None:
+                self.create_folder(current, part)
+            current = target
+        return True
+
+    def upload(self, sources, parent):
+        """Upload local files or folders into a Drive folder. Returns (ok, failed names)."""
+        result = self.run("filesystem", "upload", "--file-conflict-strategy", "create-new-revision",
+                          "--folder-conflict-strategy", "merge", *sources, parent)
+        failed = set()
+        in_failed = False
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Failed:"):
+                in_failed = True
+            elif in_failed and stripped.startswith("- "):
+                failed.add(stripped[2:].split(": ", 1)[0])
+        if result.returncode != 0 and not failed:
+            failed.add("*")
+        return result.returncode == 0, failed
+
+    def download(self, sources, folder):
+        result = self.run("filesystem", "download", "--file-conflict-strategy", "remove", *sources, folder)
+        return result.returncode == 0
+
+    def trash(self, paths):
+        """Trash several paths; on a failure, retry one by one. Returns the paths that failed."""
+        if not paths:
+            return []
+        result = self.run("filesystem", "trash", *paths)
+        if result.returncode == 0:
+            return []
+        failed = []
+        for path in paths:
+            single = self.run("filesystem", "trash", path)
+            if single.returncode != 0 and not (self.not_found(single) and self.info(path) is None):
+                failed.append(path)
+        return failed
+
+    def restore(self, name):
+        result = self.run("filesystem", "restore", drive_join("/trash", name))
+        text = (result.stdout + result.stderr).strip()
+        return result.returncode == 0, text
+
+    def delete_trashed(self, name):
+        return self.run("filesystem", "delete", drive_join("/trash", name)).returncode == 0
+
+    def first_in_trash(self, name):
+        node = self.info(drive_join("/trash", name))
+        return node.get("uid") if node else None
+
+    def walk(self, base):
+        """Everything below a Drive folder as {rel: Remote}, listing folders in parallel."""
+        found = {}
+        with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
+            pending = {pool.submit(self.list, base): ""}
+            while pending:
+                done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    prefix = pending.pop(future)
+                    for item in future.result():
+                        name = (item.get("name") or {}).get("value")
+                        if not (item.get("name") or {}).get("ok", True) or not name:
+                            continue
+                        rel = f"{prefix}/{name}" if prefix else name
+                        if item.get("type") == "folder":
+                            found[rel] = Remote(rel, "dir", item.get("uid", ""))
+                            pending[pool.submit(self.list, f"{DRIVE_ROOT}/{item['uid']}")] = rel
+                        elif item.get("type") == "file":
+                            rev = item.get("activeRevision") or {}
+                            found[rel] = Remote(
+                                rel, "file", item.get("uid", ""), rev.get("uid", ""),
+                                int(rev.get("claimedSize") or item.get("totalStorageSize") or 0),
+                                ((rev.get("claimedDigests") or {}).get("sha1") or "").lower(),
+                                parse_time(rev.get("claimedModificationTime")) or parse_time(item.get("modificationTime")) or 0,
+                            )
+        return found
+
+
+# --------------------------------------------------------------------------------------------
+# Local files
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass
+class Local:
+    rel: str
+    type: str
+    size: int = 0
+    mtime_ns: int = 0
+
+
+@dataclass
+class Scan:
+    entries: dict = field(default_factory=dict)     # rel -> Local (readable files and folders)
+    unreadable: dict = field(default_factory=dict)  # rel -> reason
+    excluded: dict = field(default_factory=dict)    # rel -> rule or "(symlink)"
+    dirty: set = field(default_factory=set)         # folders with something skipped inside
+
+    def mark_dirty(self, rel):
+        while True:
+            rel = parent_rel(rel) if rel else None
+            if rel is None:
+                return
+            self.dirty.add(rel)
+            if rel == "":
+                return
+
+
+def scan_local(root, config, single_file=False):
+    """Walk a local folder. Symlinks, excluded names and ezproton's temp folder are skipped."""
+    scan = Scan()
+    if single_file:
+        name = os.path.basename(root)
+        try:
+            info = os.stat(root, follow_symlinks=False)
+            if not os.access(root, os.R_OK):
+                scan.unreadable[name] = "can't be read"
+            else:
+                scan.entries[name] = Local(name, "file", info.st_size, info.st_mtime_ns)
+        except OSError as error:
+            scan.unreadable[name] = error.strerror
+        return scan
+
+    def walk(path, rel):
+        try:
+            iterator = list(os.scandir(path))
+        except OSError as error:
+            scan.unreadable[rel] = error.strerror or "can't be read"
+            scan.mark_dirty(rel) if rel else scan.dirty.add("")
+            return
+        for entry in iterator:
+            name = entry.name
+            child = f"{rel}/{name}" if rel else name
+            if name == TMP_NAME:
+                continue
+            rule = config.excluded_by(name)
+            if rule:
+                scan.excluded[child] = rule
+                scan.mark_dirty(child)
+                continue
+            try:
+                if entry.is_symlink():
+                    scan.excluded[child] = "(symlink)"
+                    scan.mark_dirty(child)
+                elif entry.is_dir(follow_symlinks=False):
+                    scan.entries[child] = Local(child, "dir")
+                    walk(entry.path, child)
+                elif entry.is_file(follow_symlinks=False):
+                    info = entry.stat(follow_symlinks=False)
+                    if os.access(entry.path, os.R_OK):
+                        scan.entries[child] = Local(child, "file", info.st_size, info.st_mtime_ns)
+                    else:
+                        scan.unreadable[child] = "can't be read"
+                        scan.mark_dirty(child)
+                else:
+                    scan.excluded[child] = "(special file)"
+                    scan.mark_dirty(child)
+            except OSError as error:
+                scan.unreadable[child] = error.strerror or "can't be read"
+                scan.mark_dirty(child)
+
+    walk(root, "")
+    return scan
+
+
+def stat_matches(path, size, mtime_ns):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return info.st_size == size and info.st_mtime_ns == mtime_ns
+
+
+# Desktop trash (freedesktop.org standard) ---------------------------------------------------
+
+
+def trash_local(path):
+    """Move a file or folder to the desktop trash. Returns where it went, for undo."""
+    trash = os.path.join(DATA_HOME, "Trash")
+    files, info = os.path.join(trash, "files"), os.path.join(trash, "info")
+    os.makedirs(files, mode=0o700, exist_ok=True)
+    os.makedirs(info, mode=0o700, exist_ok=True)
+    base = os.path.basename(path.rstrip("/"))
+    for n in range(1, 10000):
+        name = base if n == 1 else f"{base}.{n}"
+        info_path = os.path.join(info, name + ".trashinfo")
+        try:
+            fd = os.open(info_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        if os.path.lexists(os.path.join(files, name)):
+            os.close(fd)
+            os.unlink(info_path)
+            continue
+        with os.fdopen(fd, "w") as handle:
+            handle.write("[Trash Info]\n")
+            handle.write(f"Path={urllib.parse.quote(os.path.abspath(path))}\n")
+            handle.write(f"DeletionDate={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+        target = os.path.join(files, name)
+        try:
+            shutil.move(path, target)
+        except OSError:
+            os.unlink(info_path)
+            raise
+        return {"file": target, "info": info_path}
+    raise OSError(errno.EEXIST, "the desktop trash has too many items with this name")
+
+
+def untrash_local(record, destination):
+    if os.path.lexists(destination):
+        return False
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    shutil.move(record["file"], destination)
+    try:
+        os.unlink(record["info"])
+    except OSError:
+        pass
+    return True
+
+
+# --------------------------------------------------------------------------------------------
+# State: what ezproton remembers between runs
+# --------------------------------------------------------------------------------------------
+
+
+def state_path(entry):
+    return os.path.join(STATE_DIR, entry.kind, entry.key + ".json")
+
+
+def run_path(entry):
+    return os.path.join(STATE_DIR, "runs", entry.kind, entry.key + ".json")
+
+
+def load_state(entry):
+    return read_json(state_path(entry), {}).get("items", None)
+
+
+def save_state(entry, items):
+    atomic_write(state_path(entry), json.dumps({"local": entry.local, "items": items}))
+
+
+class Lock:
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.handle = open(os.path.join(STATE_DIR, "lock"), "w")
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.handle.close()
+            raise EzError("another ezproton run is already running.")
+        return self
+
+    def __exit__(self, *exc):
+        self.handle.close()
+
+
+# --------------------------------------------------------------------------------------------
+# Plans
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass
+class Action:
+    op: str            # upload, upload_dir, mkdir_remote, trash_remote, download, download_dir,
+                       # mkdir_local, trash_local, conflict
+    rel: str
+    new: bool = True   # upload/download: a new item (not a new version / not replacing)
+    count: int = 1     # files affected (for deletion counting)
+    remote: Remote = None
+    local: Local = None
+
+
+@dataclass
+class Plan:
+    entry: object
+    actions: list = field(default_factory=list)
+    scan: Scan = None
+    remote: dict = None
+    notes: list = field(default_factory=list)
+
+    @property
+    def deletions(self):
+        return sum(a.count for a in self.actions if a.op in ("trash_remote", "trash_local"))
+
+
+LABELS = {
+    "upload": "upload",
+    "upload_dir": "upload",
+    "mkdir_remote": "create folder on Drive",
+    "trash_remote": "trash on Drive",
+    "download": "download",
+    "download_dir": "download",
+    "mkdir_local": "create folder locally",
+    "trash_local": "trash locally",
+    "conflict": "conflict",
+}
+
+
+def topmost(rels):
+    """Drop paths that are inside another path in the list."""
+    out = []
+    for rel in sorted(rels):
+        if not any(is_under(rel, kept) for kept in out):
+            out.append(rel)
+    return out
+
+
+def count_under(rel, items):
+    files = sum(1 for r, v in items.items() if is_under(r, rel) and (v.get("type") if isinstance(v, dict) else v.type) == "file")
+    return max(files, 1)
+
+
+# Backup planning ----------------------------------------------------------------------------
+
+
+def plan_backup(entry, config, drive):
+    plan = Plan(entry)
+    if not os.path.lexists(entry.local):
+        raise EzError(f"{show(entry.local)} doesn't exist, so nothing was backed up.")
+    single = os.path.isfile(entry.local) and not os.path.isdir(entry.local)
+    scan = scan_local(entry.local, config, single_file=single)
+    plan.scan = scan
+    manifest = load_state(entry)
+    first_run = manifest is None
+    manifest = manifest or {}
+    remote = None
+    if entry.mode == "mirror":
+        remote_base = config.backup_root if single else entry.remote
+        remote = drive.walk(remote_base) if drive.info(remote_base) else {}
+        if single:
+            remote = {k: v for k, v in remote.items() if k == entry.name}
+        plan.remote = remote
+    local = scan.entries
+
+    def protected(rel):
+        """Items that must not be trashed: unreadable ones, or folders holding one."""
+        return any(is_under(rel, bad) or is_under(bad, rel) for bad in scan.unreadable)
+
+    covered = set()
+    if not single and not manifest and "" not in scan.dirty and not scan.unreadable:
+        # Nothing recorded yet and nothing to skip: upload the whole folder in one go.
+        # proton-drive merges into an existing folder and skips content it already has.
+        plan.actions.append(Action("upload_dir", "", count=sum(1 for e in local.values() if e.type == "file")))
+        covered = set(local)
+    else:
+        new_dirs = [rel for rel, e in local.items() if e.type == "dir" and rel not in manifest
+                    and not (remote is not None and rel in remote and remote[rel].type == "dir")]
+        for rel in sorted(new_dirs):
+            if any(is_under(rel, c) for c in covered):
+                continue
+            if rel not in scan.dirty:
+                files_inside = sum(1 for r, e in local.items() if e.type == "file" and is_under(r, rel))
+                plan.actions.append(Action("upload_dir", rel, count=files_inside))
+                covered.update(r for r in local if is_under(r, rel))
+            else:
+                plan.actions.append(Action("mkdir_remote", rel))
+        for rel, item in sorted(local.items()):
+            if item.type != "file" or rel in covered:
+                continue
+            known = manifest.get(rel)
+            changed = known is None or known.get("size") != item.size or known.get("mtime_ns") != item.mtime_ns
+            if not changed and remote is not None:
+                r = remote.get(rel)
+                changed = r is None or r.type != "file" or bool(r.sha1 and known.get("sha1") and r.sha1 != known["sha1"])
+            if changed:
+                is_new = known is None and not (remote is not None and rel in remote)
+                plan.actions.append(Action("upload", rel, new=is_new, local=item))
+
+    # Deletions
+    trashed = set()
+    if not first_run:
+        gone = [rel for rel in manifest if rel not in local and not protected(rel)]
+        for rel in topmost(gone):
+            plan.actions.append(Action("trash_remote", rel, count=count_under(rel, manifest)))
+            trashed.add(rel)
+    if remote is not None:
+        extra = [rel for rel in remote if rel not in local and not protected(rel)
+                 and not any(is_under(rel, t) for t in trashed)]
+        for rel in topmost(extra):
+            plan.actions.append(Action("trash_remote", rel, count=count_under(rel, remote), remote=remote[rel]))
+    return plan
+
+
+# Sync planning ------------------------------------------------------------------------------
+
+
+def plan_sync(entry, config, drive):
+    plan = Plan(entry)
+    if not os.path.isdir(entry.local):
+        raise EzError(f"{show(entry.local)} doesn't exist, so it wasn't synced.")
+    scan = scan_local(entry.local, config)
+    plan.scan = scan
+    state = load_state(entry)
+    if drive.info(entry.remote) is None:
+        if state:
+            raise EzError(
+                f"the Drive folder {entry.remote} for {show(entry.local)} is missing. ezproton won't treat that as "
+                "\"everything was deleted\". Restore it on drive.proton.me, or remove the pair and add it again."
+            )
+        everything = {}
+        plan.actions.append(Action("mkdir_remote", ""))
+    else:
+        everything = drive.walk(entry.remote)
+    remote, remote_dirty = {}, set()
+    for rel, r in everything.items():
+        if excluded_path(rel, config):
+            parts = rel.split("/")
+            for i in range(len(parts)):
+                remote_dirty.add("/".join(parts[:i]))
+        else:
+            remote[rel] = r
+    plan.remote = remote
+    state = state or {}
+    local = scan.entries
+
+    def protected(rel):
+        return any(is_under(rel, bad) or is_under(bad, rel) for bad in scan.unreadable)
+
+    def local_changed(rel):
+        s, l = state.get(rel), local.get(rel)
+        return l is not None and (s is None or s.get("size") != l.size or s.get("mtime_ns") != l.mtime_ns)
+
+    def remote_changed(rel):
+        s, r = state.get(rel), remote.get(rel)
+        return r is not None and (s is None or s.get("rev") != r.rev)
+
+    hashes = {}
+
+    def local_sha1(rel):
+        if rel not in hashes:
+            try:
+                hashes[rel] = sha1_of(os.path.join(entry.local, rel))
+            except OSError:
+                hashes[rel] = None
+        return hashes[rel]
+
+    actions, trash_remote, trash_local = [], [], []
+    for rel in sorted(set(local) | set(remote) | set(state)):
+        if protected(rel):
+            continue
+        l, r, s = local.get(rel), remote.get(rel), state.get(rel)
+        if l and r and l.type != r.type:
+            plan.notes.append(f"{rel}: a file on one side and a folder on the other, so it was skipped")
+            continue
+        kind = (l or r).type if (l or r) else (s or {}).get("type")
+        if kind == "dir":
+            if l and not r:
+                (trash_local.append(rel) if s else actions.append(Action("mkdir_remote", rel)))
+            elif r and not l:
+                (trash_remote.append(rel) if s else actions.append(Action("mkdir_local", rel, remote=r)))
+            continue
+        if l and r:
+            if s is None:
+                if not (l.size == r.size and r.sha1 and local_sha1(rel) == r.sha1):
+                    actions.append(Action("conflict", rel, local=l, remote=r))
+                continue
+            lc, rc = local_changed(rel), remote_changed(rel)
+            if lc and not rc:
+                if local_sha1(rel) != s.get("sha1"):
+                    actions.append(Action("upload", rel, new=False, local=l))
+            elif rc and not lc:
+                if r.sha1 != s.get("sha1"):
+                    actions.append(Action("download", rel, new=False, local=l, remote=r))
+            elif lc and rc:
+                mine = local_sha1(rel)
+                if mine == r.sha1:
+                    pass
+                elif mine == s.get("sha1"):
+                    actions.append(Action("download", rel, new=False, local=l, remote=r))
+                elif r.sha1 and r.sha1 == s.get("sha1"):
+                    actions.append(Action("upload", rel, new=False, local=l))
+                else:
+                    actions.append(Action("conflict", rel, local=l, remote=r))
+        elif l:
+            if s is None or (local_changed(rel) and local_sha1(rel) != s.get("sha1")):
+                actions.append(Action("upload", rel, new=True, local=l))
+            else:
+                trash_local.append(rel)
+        elif r:
+            if s is None or (remote_changed(rel) and r.sha1 != s.get("sha1")):
+                actions.append(Action("download", rel, new=True, remote=r))
+            else:
+                trash_remote.append(rel)
+
+    # A folder is trashed whole only when nothing inside it is kept; otherwise it's recreated.
+    kept = {a.rel for a in actions}
+
+    def keeps_something(rel):
+        return any(is_under(k, rel) for k in kept) or any(is_under(p, rel) for p in scan.unreadable)
+
+    def resolve(candidates, side):
+        chosen = []
+        for rel in topmost(candidates):
+            if keeps_something(rel):
+                if side == "remote" and rel in remote and remote[rel].type == "dir":
+                    actions.append(Action("mkdir_local", rel, remote=remote[rel]))
+                if side == "local" and rel in local and local[rel].type == "dir":
+                    actions.append(Action("mkdir_remote", rel))
+                chosen.extend(resolve([c for c in candidates if c != rel and is_under(c, rel)], side))
+            else:
+                chosen.append(rel)
+        return chosen
+
+    for rel in resolve(trash_remote, "remote"):
+        actions.append(Action("trash_remote", rel, count=count_under(rel, remote), remote=remote.get(rel)))
+    for rel in resolve(trash_local, "local"):
+        actions.append(Action("trash_local", rel, count=count_under(rel, local), local=local.get(rel)))
+
+    # New folders that are clean go over in one transfer instead of file by file.
+    def compact(make_op, dir_op, file_op, dirty, items):
+        out, covered = [], []
+        for action in sorted(actions, key=lambda a: a.rel):
+            if any(is_under(action.rel, c) for c in covered) and action.op in (make_op, file_op) and action.new:
+                continue
+            if action.op == make_op and action.rel and action.rel not in dirty:
+                inside = [r for r in items if is_under(r, action.rel)]
+                if all(any(a.rel == r and a.op in (make_op, file_op) and a.new for a in actions)
+                       for r in inside if r != action.rel):
+                    files = sum(1 for r in inside if items[r].type == "file")
+                    out.append(Action(dir_op, action.rel, count=files, remote=items.get(action.rel)
+                                      if dir_op == "download_dir" else None))
+                    covered.append(action.rel)
+                    continue
+            out.append(action)
+        return out
+
+    actions = compact("mkdir_remote", "upload_dir", "upload", scan.dirty, local)
+    actions = compact("mkdir_local", "download_dir", "download", remote_dirty, remote)
+    plan.actions.extend(actions)
+    return plan
+
+
+def excluded_path(rel, config):
+    return any(config.excluded_by(part) for part in rel.split("/"))
+
+
+# --------------------------------------------------------------------------------------------
+# Running plans
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass
+class Outcome:
+    journal: list = field(default_factory=list)
+    uploaded: int = 0
+    downloaded: int = 0
+    trashed_remote: int = 0
+    trashed_local: int = 0
+    conflicts: int = 0
+    skipped: list = field(default_factory=list)   # "path (reason)"
+    failed: list = field(default_factory=list)
+
+    @property
+    def partial(self):
+        return bool(self.skipped or self.failed)
+
+
+def run_backup(plan, config, drive, outcome):
+    entry = plan.entry
+    single = os.path.isfile(entry.local) and not os.path.isdir(entry.local)
+    local_base = os.path.dirname(entry.local) if single else entry.local
+    remote_base = config.backup_root if single else entry.remote
+    scan = plan.scan
+    manifest = load_state(entry) or {}
+    confirmed = {}   # rel -> manifest record for items now known to be on Drive
+    unconfirmed = set()
+    actions = plan.actions
+
+    for rel in scan.unreadable:
+        outcome.skipped.append(f"{show(rel_join(local_base, rel))} ({scan.unreadable[rel]})")
+
+    def rpath(rel):
+        return drive_join(remote_base, *rel.split("/")) if rel else remote_base
+
+    drive.mkdirs(config.backup_root)
+    whole = any(a.op == "upload_dir" and a.rel == "" for a in actions)
+    root_existed = drive.info(remote_base) is not None if not single else True
+    if not whole and not single:
+        drive.mkdirs(remote_base)
+
+    # Folders first, top-down.
+    for action in sorted((a for a in actions if a.op == "mkdir_remote"), key=lambda a: a.rel.count("/")):
+        if drive.info(rpath(action.rel)) is None:
+            drive.create_folder(rpath(parent_rel(action.rel)), os.path.basename(action.rel))
+            outcome.journal.append({"op": "mkdir_remote", "remote": rpath(action.rel)})
+        confirmed[action.rel] = {"type": "dir"}
+
+    # Uploads, grouped by Drive folder.
+    batches = {}
+    for action in actions:
+        if action.op == "upload_dir" and action.rel == "":
+            batches.setdefault(("", "root"), []).append(action)
+        elif action.op in ("upload", "upload_dir"):
+            batches.setdefault((parent_rel(action.rel), "in"), []).append(action)
+
+    def do_batch(key):
+        parent, how = key
+        items = batches[key]
+        if how == "root":
+            ok, failed = drive.upload([entry.local], config.backup_root)
+            return items, failed, {entry.local}
+        sources = []
+        for action in items:
+            path = rel_join(local_base, action.rel)
+            if action.op == "upload" and not stat_matches(path, action.local.size, action.local.mtime_ns):
+                continue
+            sources.append(path)
+        if not sources:
+            return items, set(), set()
+        ok, failed = drive.upload(sources, rpath(parent))
+        return items, failed, set(sources)
+
+    if batches:
+        with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+            results = list(pool.map(do_batch, list(batches)))
+        for items, failed, sources in results:
+            for action in items:
+                path = rel_join(local_base, action.rel)
+                if action.op == "upload_dir":
+                    inside = {r: e for r, e in scan.entries.items() if is_under(r, action.rel)}
+                    if failed:
+                        unconfirmed.update(inside)
+                        names = sorted(n for n in failed if n != "*")
+                        for name in names:
+                            matches = [r for r, e in inside.items() if e.type == "file" and os.path.basename(r) == name]
+                            for r in matches or [name]:
+                                outcome.failed.append(f"{show(rel_join(local_base, r))} (upload failed)")
+                        if not names:
+                            outcome.failed.append(f"{show(path)} (upload failed)")
+                        continue
+                    for r, e in inside.items():
+                        record = {"type": e.type}
+                        if e.type == "file":
+                            file_path = rel_join(local_base, r)
+                            if not stat_matches(file_path, e.size, e.mtime_ns):
+                                unconfirmed.add(r)
+                                outcome.skipped.append(f"{show(file_path)} (changed during the upload; will be uploaded again)")
+                                continue
+                            record.update(size=e.size, mtime_ns=e.mtime_ns, sha1=sha1_of(file_path))
+                        confirmed[r] = record
+                    outcome.uploaded += action.count
+                    if action.rel or not root_existed:
+                        outcome.journal.append({"op": "upload_new", "remote": rpath(action.rel), "dir": True})
+                    continue
+                if path not in sources:
+                    unconfirmed.add(action.rel)
+                    outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
+                    continue
+                if os.path.basename(path) in failed or "*" in failed:
+                    unconfirmed.add(action.rel)
+                    outcome.failed.append(f"{show(path)} (upload failed)")
+                    continue
+                if not stat_matches(path, action.local.size, action.local.mtime_ns):
+                    unconfirmed.add(action.rel)
+                    outcome.skipped.append(f"{show(path)} (changed during the upload; will be uploaded again)")
+                    continue
+                digest = sha1_of(path)
+                confirmed[action.rel] = {"type": "file", "size": action.local.size,
+                                         "mtime_ns": action.local.mtime_ns, "sha1": digest}
+                outcome.uploaded += 1
+                outcome.journal.append({"op": "upload_new" if action.new else "upload_version",
+                                        "remote": rpath(action.rel), "sha1": digest})
+
+    # Deletions, to Drive's trash. The IDs are recorded for undo.
+    trash_actions = [a for a in actions if a.op == "trash_remote"]
+    trashed = set()
+    if trash_actions:
+        targets = {rpath(a.rel): a for a in trash_actions}
+
+        def uid_for(item):
+            path, action = item
+            if action.remote is not None:
+                return path, action.remote.uid
+            node = drive.info(path)
+            return path, node.get("uid") if node else None
+
+        with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
+            uids = dict(pool.map(uid_for, targets.items()))
+        existing = {f"{DRIVE_ROOT}/{uids[p]}": p for p in targets if uids.get(p)}
+        failed = set(drive.trash(list(existing)))
+        for path, action in targets.items():
+            uid = uids.get(path)
+            if uid and f"{DRIVE_ROOT}/{uid}" in failed:
+                outcome.failed.append(f"{path} on Drive (couldn't be moved to the trash)")
+                continue
+            trashed.add(action.rel)
+            if uid:
+                outcome.trashed_remote += action.count
+                outcome.journal.append({"op": "trash_remote", "remote": path, "uid": uid,
+                                        "name": os.path.basename(action.rel)})
+
+    # The new record of what is on Drive.
+    new = {}
+    for rel, item in scan.entries.items():
+        if rel in confirmed:
+            new[rel] = confirmed[rel]
+        elif rel in manifest:
+            new[rel] = {"type": "dir"} if item.type == "dir" else manifest[rel]
+    for rel, record in manifest.items():
+        if rel in new or any(is_under(rel, t) for t in trashed):
+            continue
+        if any(is_under(rel, bad) or is_under(bad, rel) for bad in scan.unreadable):
+            new[rel] = record
+    save_state(entry, new)
+
+
+def run_sync(plan, config, drive, outcome):
+    entry = plan.entry
+    base = entry.local
+    remote = plan.remote or {}
+    state = load_state(entry) or {}
+    new_state = dict(state)
+    written = set()
+    scan = plan.scan
+    tmp_root = os.path.join(base, TMP_NAME)
+    actions = plan.actions
+
+    for rel in scan.unreadable:
+        outcome.skipped.append(f"{show(rel_join(base, rel))} ({scan.unreadable[rel]})")
+
+    def rpath(rel):
+        return drive_join(entry.remote, *rel.split("/")) if rel else entry.remote
+
+    def lpath(rel):
+        return rel_join(base, rel)
+
+    def remember(rel, record):
+        new_state[rel] = record
+        written.add(rel)
+
+    def forget(rel):
+        for key in [k for k in new_state if is_under(k, rel)]:
+            del new_state[key]
+        written.add(rel)
+
+    # 1. Folders.
+    if any(a.op == "mkdir_remote" and a.rel == "" for a in actions):
+        drive.mkdirs(entry.remote)
+    for action in sorted((a for a in actions if a.op == "mkdir_remote" and a.rel), key=lambda a: a.rel.count("/")):
+        if drive.info(rpath(action.rel)) is None:
+            drive.create_folder(rpath(parent_rel(action.rel)), os.path.basename(action.rel))
+            outcome.journal.append({"op": "mkdir_remote", "remote": rpath(action.rel)})
+        remember(action.rel, {"type": "dir"})
+    for action in sorted((a for a in actions if a.op == "mkdir_local"), key=lambda a: a.rel.count("/")):
+        if not os.path.isdir(lpath(action.rel)):
+            os.makedirs(lpath(action.rel))
+            outcome.journal.append({"op": "mkdir_local", "local": lpath(action.rel)})
+        remember(action.rel, {"type": "dir"})
+
+    # 2. Conflicts: the laptop copy is renamed and uploaded; the Drive copy is downloaded.
+    uploads = [(a.rel, a.local, a.new) for a in actions if a.op == "upload"]
+    downloads = [a for a in actions if a.op == "download"]
+    for action in (a for a in actions if a.op == "conflict"):
+        path = lpath(action.rel)
+        if not stat_matches(path, action.local.size, action.local.mtime_ns):
+            outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
+            continue
+        renamed = conflict_name(path)
+        os.rename(path, renamed)
+        outcome.journal.append({"op": "rename_local", "from": path, "to": renamed})
+        new_rel = os.path.relpath(renamed, base)
+        info = os.stat(renamed)
+        uploads.append((new_rel, Local(new_rel, "file", info.st_size, info.st_mtime_ns), True))
+        downloads.append(Action("download", action.rel, new=True, remote=action.remote))
+        outcome.conflicts += 1
+
+    # 3. Uploads, grouped by Drive folder; whole new folders in one go.
+    groups = {}
+    for rel, item, is_new in uploads:
+        groups.setdefault(parent_rel(rel), []).append(("file", rel, item, is_new))
+    for action in (a for a in actions if a.op == "upload_dir"):
+        groups.setdefault(parent_rel(action.rel), []).append(("dir", action.rel, None, True))
+
+    def do_upload(parent):
+        sources = []
+        for kind, rel, item, is_new in groups[parent]:
+            if kind == "dir":
+                files = {r: e for r, e in scan.entries.items() if is_under(r, rel) and e.type == "file"}
+                sources.append((kind, rel, {r: (e, sha1_of(lpath(r))) for r, e in files.items()}, is_new))
+            elif stat_matches(lpath(rel), item.size, item.mtime_ns):
+                sources.append((kind, rel, (item, sha1_of(lpath(rel))), is_new))
+            else:
+                outcome.skipped.append(f"{show(lpath(rel))} (changed during the run; left for next time)")
+        if not sources:
+            return []
+        ok, failed = drive.upload([lpath(rel) for _, rel, _, _ in sources], rpath(parent))
+        done = []
+        for kind, rel, data, is_new in sources:
+            if kind == "dir" and failed:
+                outcome.failed.append(f"{show(lpath(rel))} (some files failed to upload)")
+            elif kind == "file" and (os.path.basename(rel) in failed or "*" in failed):
+                outcome.failed.append(f"{show(lpath(rel))} (upload failed)")
+            else:
+                done.append((kind, rel, data, is_new))
+        return done
+
+    uploaded = []
+    if groups:
+        with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+            for done in pool.map(do_upload, list(groups)):
+                uploaded.extend(done)
+    if uploaded:
+        # Learn the new revisions, and check that Drive has what was hashed.
+        folders = sorted({parent_rel(rel) for kind, rel, _, _ in uploaded if kind == "file"})
+        with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
+            listings = dict(zip(folders, pool.map(lambda p: drive.list(rpath(p)), folders)))
+        seen = {}
+        for parent, items in listings.items():
+            for node in items:
+                name = (node.get("name") or {}).get("value")
+                if name:
+                    seen[f"{parent}/{name}" if parent else name] = node
+        trees = {rel: drive.walk(rpath(rel)) for kind, rel, _, _ in uploaded if kind == "dir"}
+        for kind, rel, data, is_new in uploaded:
+            if kind == "dir":
+                remember(rel, {"type": "dir"})
+                tree = trees.get(rel, {})
+                for sub, r in tree.items():
+                    full = f"{rel}/{sub}"
+                    if r.type == "dir":
+                        remember(full, {"type": "dir"})
+                    elif full in data:
+                        item, digest = data[full]
+                        if r.sha1 == digest and stat_matches(lpath(full), item.size, item.mtime_ns):
+                            remember(full, {"type": "file", "size": item.size, "mtime_ns": item.mtime_ns,
+                                            "sha1": digest, "rev": r.rev})
+                outcome.uploaded += len(data)
+                outcome.journal.append({"op": "upload_new", "remote": rpath(rel), "dir": True})
+                continue
+            item, digest = data
+            node = seen.get(rel) or {}
+            rev = node.get("activeRevision") or {}
+            remote_sha1 = ((rev.get("claimedDigests") or {}).get("sha1") or "").lower()
+            outcome.uploaded += 1
+            outcome.journal.append({"op": "upload_new" if is_new else "upload_version",
+                                    "remote": rpath(rel), "sha1": digest})
+            if remote_sha1 == digest and stat_matches(lpath(rel), item.size, item.mtime_ns):
+                remember(rel, {"type": "file", "size": item.size, "mtime_ns": item.mtime_ns,
+                               "sha1": digest, "rev": rev.get("uid", "")})
+            else:
+                # It changed while uploading: forget it, so the next run compares both sides again.
+                forget(rel)
+
+    # 4. Downloads into a temporary folder inside the pair, then moved into place.
+    dir_downloads = [a for a in actions if a.op == "download_dir"]
+    if downloads or dir_downloads:
+        os.makedirs(tmp_root, exist_ok=True)
+        try:
+            by_parent = {}
+            for action in downloads:
+                by_parent.setdefault(parent_rel(action.rel), []).append(action)
+            for index, (parent, group) in enumerate(sorted(by_parent.items())):
+                staging = os.path.join(tmp_root, f"f{index}")
+                os.makedirs(staging)
+                ok = drive.download([rpath(a.rel) for a in group], staging)
+                for action in group:
+                    place_download(action, os.path.join(staging, os.path.basename(action.rel)),
+                                   lpath(action.rel), outcome, remember, ok)
+            for index, action in enumerate(dir_downloads):
+                staging = os.path.join(tmp_root, f"d{index}")
+                os.makedirs(staging)
+                target = lpath(action.rel)
+                fetched = os.path.join(staging, os.path.basename(action.rel))
+                if not drive.download([rpath(action.rel)], staging) or not os.path.isdir(fetched):
+                    outcome.failed.append(f"{show(target)} (download failed)")
+                    continue
+                if os.path.lexists(target):
+                    outcome.skipped.append(f"{show(target)} (appeared during the run; left for next time)")
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                os.rename(fetched, target)
+                remember(action.rel, {"type": "dir"})
+                count = 0
+                for rel, r in remote.items():
+                    if not is_under(rel, action.rel) or rel == action.rel:
+                        continue
+                    if r.type == "dir":
+                        remember(rel, {"type": "dir"})
+                        continue
+                    path = lpath(rel)
+                    if not os.path.isfile(path):
+                        continue
+                    if r.mtime:
+                        os.utime(path, (r.mtime, r.mtime))
+                    info = os.stat(path)
+                    remember(rel, {"type": "file", "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                                   "sha1": r.sha1, "rev": r.rev})
+                    count += 1
+                outcome.downloaded += count
+                outcome.journal.append({"op": "download_new", "local": target, "dir": True})
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    # 5. Deletions.
+    remote_trash = [a for a in actions if a.op == "trash_remote"]
+    if remote_trash:
+        paths = [f"{DRIVE_ROOT}/{a.remote.uid}" if a.remote and a.remote.uid else rpath(a.rel) for a in remote_trash]
+        failed = set(drive.trash(paths))
+        for action, path in zip(remote_trash, paths):
+            if path in failed:
+                outcome.failed.append(f"{rpath(action.rel)} on Drive (couldn't be moved to the trash)")
+                continue
+            outcome.trashed_remote += action.count
+            outcome.journal.append({"op": "trash_remote", "remote": rpath(action.rel),
+                                    "uid": action.remote.uid if action.remote else "",
+                                    "name": os.path.basename(action.rel)})
+            forget(action.rel)
+    for action in (a for a in actions if a.op == "trash_local"):
+        path = lpath(action.rel)
+        if action.local and action.local.type == "file" and not stat_matches(path, action.local.size, action.local.mtime_ns):
+            outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
+            continue
+        try:
+            record = trash_local(path)
+        except OSError as error:
+            outcome.failed.append(f"{show(path)} (couldn't be moved to the trash: {error.strerror})")
+            continue
+        outcome.trashed_local += action.count
+        outcome.journal.append({"op": "trash_local", "local": path, "trashed": record})
+        forget(action.rel)
+
+    # 6. Everything that was already in sync is remembered as it is now.
+    for rel, item in scan.entries.items():
+        r = remote.get(rel)
+        if rel in written or r is None or r.type != item.type:
+            continue
+        if item.type == "dir":
+            new_state[rel] = {"type": "dir"}
+            continue
+        old = state.get(rel)
+        if old and old.get("size") == item.size and old.get("mtime_ns") == item.mtime_ns and old.get("rev") == r.rev:
+            continue
+        if not stat_matches(lpath(rel), item.size, item.mtime_ns):
+            continue
+        if old and old.get("sha1") and old.get("sha1") == r.sha1:
+            new_state[rel] = dict(old, size=item.size, mtime_ns=item.mtime_ns, rev=r.rev)
+        elif r.sha1 and sha1_of(lpath(rel)) == r.sha1:
+            new_state[rel] = {"type": "file", "size": item.size, "mtime_ns": item.mtime_ns, "sha1": r.sha1, "rev": r.rev}
+    for rel in state:
+        if rel in written or rel in scan.entries or rel in remote:
+            continue
+        if not any(is_under(rel, bad) or is_under(bad, rel) for bad in scan.unreadable):
+            new_state.pop(rel, None)
+    save_state(entry, new_state)
+
+
+def place_download(action, fetched, path, outcome, remember, ok):
+    r = action.remote
+    if not ok and not os.path.isfile(fetched):
+        outcome.failed.append(f"{show(path)} (download failed)")
+        return
+    if not os.path.isfile(fetched):
+        outcome.failed.append(f"{show(path)} (download failed)")
+        return
+    record = None
+    if os.path.lexists(path):
+        if action.local is None or not stat_matches(path, action.local.size, action.local.mtime_ns):
+            outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
+            return
+        record = trash_local(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.replace(fetched, path)
+    if r.mtime:
+        os.utime(path, (r.mtime, r.mtime))
+    info = os.stat(path)
+    outcome.downloaded += 1
+    if record:
+        outcome.journal.append({"op": "download_replace", "local": path, "size": info.st_size,
+                                "mtime_ns": info.st_mtime_ns, "trashed": record})
+    else:
+        outcome.journal.append({"op": "download_new", "local": path, "size": info.st_size,
+                                "mtime_ns": info.st_mtime_ns})
+    rel = action.rel
+    remember(rel, {"type": "file", "size": info.st_size, "mtime_ns": info.st_mtime_ns, "sha1": r.sha1, "rev": r.rev})
+
+
+def conflict_name(path):
+    folder, name = os.path.split(path)
+    stem, dot, suffix = name.rpartition(".")
+    if not dot or not stem:
+        stem, suffix = name, ""
+    stamp = time.strftime("%Y-%m-%d %H%M")
+    for n in range(1, 1000):
+        extra = "" if n == 1 else f" {n}"
+        candidate = f"{stem} (conflict {HOSTNAME} {stamp}{extra})" + (f".{suffix}" if suffix else "")
+        full = os.path.join(folder, candidate)
+        if not os.path.lexists(full):
+            return full
+    raise EzError(f"can't find a free conflict name for {show(path)}")
+
+
+# --------------------------------------------------------------------------------------------
+# Run records (for last and undo)
+# --------------------------------------------------------------------------------------------
+
+
+def write_record(entry, result, started, outcome, drive, prev_state, message=""):
+    log_path = run_path(entry)[:-5] + ".log"
+    atomic_write(log_path, "\n".join(drive.log) if drive else message)
+    record = {
+        "local": entry.local,
+        "remote": entry.remote,
+        "result": result,
+        "message": message,
+        "started": started,
+        "finished": time.time(),
+        "uploaded": outcome.uploaded,
+        "downloaded": outcome.downloaded,
+        "trashed_remote": outcome.trashed_remote,
+        "trashed_local": outcome.trashed_local,
+        "conflicts": outcome.conflicts,
+        "skipped": outcome.skipped,
+        "failed": outcome.failed,
+        "journal": outcome.journal,
+        "prev_state": prev_state,
+        "undone": False,
+    }
+    atomic_write(run_path(entry), json.dumps(record))
+
+
+# --------------------------------------------------------------------------------------------
+# Selecting entries from the command line
+# --------------------------------------------------------------------------------------------
+
+
+def resolve_arg(text):
+    if text == "~" or text.startswith("~/"):
+        text = HOME + text[1:]
+    return os.path.normpath(os.path.abspath(text))
+
+
+def select(config, kind, paths):
+    """The backup entries and/or sync pairs a command covers."""
+    backups = config.backups if kind in (None, "backup") else []
+    pairs = config.pairs if kind in (None, "sync") else []
+    if not paths:
+        return list(backups), list(pairs)
+    chosen_b, chosen_p = [], []
+    for text in paths:
+        path = resolve_arg(text)
+        b = next((e for e in config.backups if e.local == path), None)
+        p = next((e for e in config.pairs if e.local == path), None)
+        if b and kind in (None, "backup"):
+            chosen_b.append(b)
+        elif p and kind in (None, "sync"):
+            chosen_p.append(p)
+        elif b or p:
+            other = "backup" if b else "sync"
+            raise UsageError(f"{show(path)} is set up for {other}, not {kind}.")
+        else:
+            configured = [f"  backup  {show(e.local)}" for e in config.backups] + [
+                f"  sync    {show(e.local)} : {e.remote}" for e in config.pairs]
+            raise UsageError(f"{show(path)} isn't configured. Configured:\n" + ("\n".join(configured) or "  (nothing)"))
+    return chosen_b, chosen_p
+
+
+# --------------------------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------------------------
+
+
+def print_plan(plan, config):
+    entry = plan.entry
+    base = os.path.dirname(entry.local) if entry.kind == "backup" and os.path.isfile(entry.local) else entry.local
+    label = f"{show(entry.local)}" + (f" : {entry.remote}" if entry.kind == "sync" else f"  →  {entry.remote}")
+    print(f"{BOLD}{entry.kind} {label}{RESET}")
+    if not plan.actions:
+        print(f"  {DIM}nothing to do{RESET}")
+    lines = []
+    for action in plan.actions:
+        what = LABELS[action.op]
+        if action.op in ("upload_dir", "download_dir"):
+            # Whole folders are listed file by file, so the preview shows everything.
+            items = plan.scan.entries if action.op == "upload_dir" else (plan.remote or {})
+            inside = sorted(r for r, e in items.items() if is_under(r, action.rel) and e.type == "file")
+            lines.extend((what, r) for r in inside)
+            if not inside:
+                lines.append(("create folder on Drive" if action.op == "upload_dir" else "create folder locally",
+                              action.rel))
+            continue
+        if action.op in ("upload", "download") and not action.new:
+            what += " (new version)" if action.op == "upload" else " (replace)"
+        if action.op in ("trash_remote", "trash_local") and action.count > 1:
+            what += f" ({plural(action.count, 'file')})"
+        lines.append((what, action.rel))
+    for what, rel in sorted(lines, key=lambda x: (x[0], x[1])):
+        shown_path = show(rel_join(base, rel)) if rel else show(base)
+        print(f"  {what:<28} {shown_path}")
+    for note in plan.notes:
+        print(f"  {YELLOW}{note}{RESET}")
+
+
+def preflight(config, backups, pairs, drive, need_drive):
+    missing = [e.local for e in backups + pairs if not os.path.lexists(e.local)]
+    if missing:
+        raise EzError("these are configured but don't exist, so nothing was done:\n"
+                      + "\n".join(f"  {show(m)}" for m in missing)
+                      + "\nFix or remove those lines with \"ezproton edit\".")
+    if need_drive:
+        drive.check_login()
+
+
+def cmd_run(kind, paths, yes):
+    config = config_or_die()
+    backups, pairs = select(config, kind, paths)
+    entries = backups if kind == "backup" else pairs
+    if not entries:
+        print(f"Nothing is set up for {kind}. Add some with \"ezproton edit {kind}\".")
+        return OK
+    with Lock():
+        drive = Drive()
+        preflight(config, backups if kind == "backup" else [], pairs if kind == "sync" else [], drive, True)
+        plans = []
+        for entry in entries:
+            plans.append(plan_backup(entry, config, drive) if kind == "backup" else plan_sync(entry, config, drive))
+        total = sum(p.deletions for p in plans)
+        if total > config.delete_limit and not yes:
+            for plan in plans:
+                if plan.deletions:
+                    print_plan(plan, config)
+            print(f"\n{RED}This run would delete {plural(total, 'item')}, more than the limit of "
+                  f"{config.delete_limit}. Nothing was changed.{RESET}")
+            print("Check the list above (or run \"ezproton preview\"), then repeat with --yes to go ahead.")
+            return LIMIT
+        worst = OK
+        for plan in plans:
+            entry = plan.entry
+            started = time.time()
+            prev = load_state(entry)
+            outcome = Outcome()
+            entry_drive = Drive()
+            try:
+                (run_backup if kind == "backup" else run_sync)(plan, config, entry_drive, outcome)
+            except EzError as error:
+                write_record(entry, "failed", started, outcome, entry_drive, prev, str(error))
+                raise
+            result = "partial" if outcome.partial else "success"
+            write_record(entry, result, started, outcome, entry_drive, prev)
+            summary = describe(outcome, kind)
+            colour = YELLOW if outcome.partial else GREEN
+            print(f"{colour}{kind} {show(entry.local)}: {result}{RESET}  {summary}")
+            for line in outcome.skipped + outcome.failed:
+                print(f"  {YELLOW}skipped: {line}{RESET}")
+            if outcome.partial:
+                worst = PARTIAL
+        return worst
+
+
+def describe(outcome, kind):
+    parts = []
+    if outcome.uploaded:
+        parts.append(f"{plural(outcome.uploaded, 'file')} uploaded")
+    if outcome.downloaded:
+        parts.append(f"{outcome.downloaded} downloaded")
+    if outcome.conflicts:
+        parts.append(plural(outcome.conflicts, "conflict"))
+    if outcome.trashed_remote:
+        parts.append(f"{outcome.trashed_remote} to Drive's trash")
+    if outcome.trashed_local:
+        parts.append(f"{outcome.trashed_local} to the desktop trash")
+    return ", ".join(parts) or "nothing to do"
+
+
+def cmd_check(kind, paths):
+    config = load_config()
+    problems = list(config.problems)
+    for message in config.warnings:
+        warn(message)
+    backups, pairs = select(config, kind, paths) if not problems else (
+        config.backups if kind in (None, "backup") else [], config.pairs if kind in (None, "sync") else [])
+    drive = Drive()
+    try:
+        drive.check_login()
+        login = f"{GREEN}logged in{RESET}"
+        online = True
+    except DriveError as error:
+        login = f"{RED}{str(error).splitlines()[0]}{RESET}"
+        online = False
+    print(f"{BOLD}Proton Drive:{RESET} {login}")
+    if kind in (None, "backup"):
+        print(f"{BOLD}Backup root:{RESET}  {config.backup_root}")
+    print(f"{BOLD}Deletion limit:{RESET} {config.delete_limit} per run\n")
+
+    if kind in (None, "backup"):
+        print(f"{BOLD}Backup{RESET}")
+        if not backups:
+            print(f"  {DIM}nothing set up (ezproton edit backup){RESET}")
+        for entry in backups:
+            exists = os.path.lexists(entry.local)
+            if not exists:
+                problems.append(f"{show(entry.local)} doesn't exist")
+                print(f"  {show(entry.local):<30} {RED}missing{RESET}")
+                continue
+            single = os.path.isfile(entry.local)
+            scan = scan_local(entry.local, config, single_file=single)
+            files = [e for e in scan.entries.values() if e.type == "file"]
+            size = sum(e.size for e in files)
+            print(f"  {show(entry.local):<30} {plural(len(files), 'file')}, {human(size)}, "
+                  f"{len(scan.excluded)} excluded, mode {entry.mode}")
+            print(f"  {'':<30} {DIM}→ {entry.remote}   last: {last_line(entry)}{RESET}")
+            if scan.unreadable:
+                print(f"  {'':<30} {YELLOW}{plural(len(scan.unreadable), 'item')} can't be read{RESET}")
+        print()
+    if kind in (None, "sync"):
+        print(f"{BOLD}Sync{RESET}")
+        if not pairs:
+            print(f"  {DIM}nothing set up (ezproton edit sync){RESET}")
+        remote_exists = {}
+        if online and pairs:
+            with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
+                remote_exists = dict(zip([p.remote for p in pairs],
+                                         pool.map(lambda p: drive.info(p.remote) is not None, pairs)))
+        for pair in pairs:
+            local_ok = os.path.isdir(pair.local)
+            if not local_ok:
+                problems.append(f"{show(pair.local)} doesn't exist")
+            state = "?" if not online else ("exists" if remote_exists.get(pair.remote) else "not created yet")
+            print(f"  {show(pair.local):<30} {'exists' if local_ok else RED + 'missing' + RESET}")
+            print(f"  {'':<30} {DIM}: {pair.remote} ({state})   last: {last_line(pair)}{RESET}")
+        print()
+    if problems:
+        print(f"{RED}Problems:{RESET}")
+        for problem in problems:
+            print(f"  {problem}")
+        return ERROR
+    return OK
+
+
+def last_line(entry):
+    record = read_json(run_path(entry), None)
+    if not record:
+        return "never"
+    return f"{record['result']} {when(record['started'])}"
+
+
+def cmd_preview(kind, paths, excluded):
+    config = config_or_die()
+    backups, pairs = select(config, kind, paths)
+    if not backups and not pairs:
+        print("Nothing is set up. Add folders with \"ezproton edit backup\" or \"ezproton edit sync\".")
+        return OK
+    drive = Drive()
+    preflight(config, backups, pairs, drive, True)
+    total_backup = total_sync = 0
+    for entry in backups:
+        plan = plan_backup(entry, config, drive)
+        print_plan(plan, config)
+        total_backup += plan.deletions
+        if excluded:
+            print_excluded(plan)
+        print()
+    for pair in pairs:
+        plan = plan_sync(pair, config, drive)
+        print_plan(plan, config)
+        total_sync += plan.deletions
+        if excluded:
+            print_excluded(plan)
+        print()
+    for label, total in (("backup", total_backup), ("sync", total_sync)):
+        if total > config.delete_limit:
+            print(f"{YELLOW}A {label} run would delete {plural(total, 'item')}, more than the limit of "
+                  f"{config.delete_limit}: it will stop and ask you to repeat it with --yes.{RESET}")
+    return OK
+
+
+def print_excluded(plan):
+    entry = plan.entry
+    base = os.path.dirname(entry.local) if entry.kind == "backup" and os.path.isfile(entry.local) else entry.local
+    scan = plan.scan
+    if not scan.excluded and not scan.unreadable:
+        return
+    print(f"  {BOLD}skipped{RESET}")
+    for rel, rule in sorted(scan.excluded.items()):
+        print(f"  {rule:<28} {show(rel_join(base, rel))}")
+    for rel, reason in sorted(scan.unreadable.items()):
+        print(f"  {'(' + reason + ')':<28} {show(rel_join(base, rel))}")
+
+
+def cmd_last(kind, paths, show_log):
+    config = config_or_die()
+    backups, pairs = select(config, kind, paths)
+    for entry in backups + pairs:
+        record = read_json(run_path(entry), None)
+        title = f"{BOLD}{entry.kind} {show(entry.local)}{RESET}"
+        if show_log:
+            print(f"{title}\n")
+            log_path = run_path(entry)[:-5] + ".log"
+            try:
+                with open(log_path) as handle:
+                    print(handle.read())
+            except OSError:
+                print("  no run recorded yet\n")
+            continue
+        if not record:
+            print(f"{title}: never run\n")
+            continue
+        colour = {"success": GREEN, "partial": YELLOW}.get(record["result"], RED)
+        took = record["finished"] - record["started"]
+        print(f"{title}: {colour}{record['result']}{RESET}, {when(record['started'])}, took {int(took)} s"
+              + ("  (undone)" if record.get("undone") else ""))
+        if record.get("message"):
+            print(f"  {record['message']}")
+        outcome = Outcome(uploaded=record["uploaded"], downloaded=record["downloaded"],
+                          trashed_remote=record["trashed_remote"], trashed_local=record["trashed_local"],
+                          conflicts=record["conflicts"])
+        print(f"  {describe(outcome, entry.kind)}")
+        for line in record.get("skipped", []) + record.get("failed", []):
+            print(f"  {YELLOW}skipped: {line}{RESET}")
+        print()
+    return OK
+
+
+# undo ---------------------------------------------------------------------------------------
+
+
+def cmd_undo(kind, paths, yes):
+    config = config_or_die()
+    backups, pairs = select(config, kind, paths)
+    records = []
+    for entry in backups + pairs:
+        record = read_json(run_path(entry), None)
+        if record and not record.get("undone") and record.get("journal") is not None:
+            records.append((entry, record))
+    if not records:
+        raise EzError("there's no run to undo (each run can be undone once).")
+    print("Undo will reverse:")
+    for entry, record in records:
+        print(f"  {entry.kind} {show(entry.local)}  (run of {when(record['started'])}, "
+              f"{plural(len(record['journal']), 'action')})")
+    if not yes:
+        if not sys.stdin.isatty():
+            raise EzError("undo needs confirmation: run it in a terminal, or add --yes.")
+        if ask("Go ahead? [y/N] ", ["n", "y"]) != "y":
+            print("Nothing was changed.")
+            return OK
+    with Lock():
+        drive = Drive()
+        drive.check_login()
+        worst = OK
+        for entry, record in records:
+            leftovers = undo_record(entry, record, drive)
+            record["undone"] = True
+            atomic_write(run_path(entry), json.dumps(record))
+            if record.get("prev_state") is None:
+                try:
+                    os.unlink(state_path(entry))
+                except OSError:
+                    pass
+            else:
+                save_state(entry, record["prev_state"])
+            if leftovers:
+                worst = PARTIAL
+                print(f"{YELLOW}{entry.kind} {show(entry.local)}: undone, except:{RESET}")
+                for line in leftovers:
+                    print(f"  {line}")
+            else:
+                print(f"{GREEN}{entry.kind} {show(entry.local)}: undone{RESET}")
+        return worst
+
+
+def undo_record(entry, record, drive):
+    leftovers = []
+    trash_cache = {}
+    for item in reversed(record["journal"]):
+        op = item["op"]
+        try:
+            if op == "upload_new":
+                node = drive.info(item["remote"])
+                if node is None:
+                    continue
+                current = (((node.get("activeRevision") or {}).get("claimedDigests") or {}).get("sha1") or "").lower()
+                if item.get("sha1") and current and current != item["sha1"]:
+                    leftovers.append(f"{item['remote']} on Drive changed since the run; left as it is")
+                    continue
+                if drive.trash([f"{DRIVE_ROOT}/{node['uid']}"]):
+                    leftovers.append(f"{item['remote']} on Drive couldn't be moved to the trash")
+            elif op == "upload_version":
+                leftovers.append(f"{item['remote']}: a new version was uploaded. Pick the previous version in the "
+                                 "file's version history on drive.proton.me.")
+            elif op == "mkdir_remote":
+                node = drive.info(item["remote"])
+                if node is not None and not drive.list(f"{DRIVE_ROOT}/{node['uid']}"):
+                    drive.trash([f"{DRIVE_ROOT}/{node['uid']}"])
+            elif op == "trash_remote":
+                message = undo_trash_remote(item, drive, trash_cache)
+                if message:
+                    leftovers.append(message)
+            elif op == "download_new" and item.get("dir"):
+                path = item["local"]
+                if not os.path.lexists(path):
+                    continue
+                newer = [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs
+                         if os.lstat(os.path.join(d, f)).st_mtime > record["finished"]]
+                if newer:
+                    leftovers.append(f"{show(path)} has files changed since the run; left as it is")
+                    continue
+                trash_local(path)
+            elif op == "download_new":
+                path = item["local"]
+                if not os.path.lexists(path):
+                    continue
+                if not stat_matches(path, item["size"], item["mtime_ns"]):
+                    leftovers.append(f"{show(path)} changed since the run; left as it is")
+                    continue
+                trash_local(path)
+            elif op == "download_replace":
+                path = item["local"]
+                if os.path.lexists(path) and not stat_matches(path, item["size"], item["mtime_ns"]):
+                    leftovers.append(f"{show(path)} changed since the run; left as it is")
+                    continue
+                if not os.path.lexists(item["trashed"]["file"]):
+                    leftovers.append(f"{show(path)}: the old copy is no longer in the desktop trash")
+                    continue
+                if os.path.lexists(path):
+                    trash_local(path)
+                untrash_local(item["trashed"], path)
+            elif op == "trash_local":
+                path = item["local"]
+                if not os.path.lexists(item["trashed"]["file"]):
+                    leftovers.append(f"{show(path)} is no longer in the desktop trash")
+                elif not untrash_local(item["trashed"], path):
+                    leftovers.append(f"{show(path)} exists again, so the trashed copy was left in the desktop trash")
+            elif op == "mkdir_local":
+                try:
+                    os.rmdir(item["local"])
+                except OSError:
+                    pass
+            elif op == "rename_local":
+                if os.path.lexists(item["from"]):
+                    leftovers.append(f"{show(item['from'])} exists, so {show(item['to'])} keeps its conflict name")
+                elif os.path.lexists(item["to"]):
+                    os.rename(item["to"], item["from"])
+        except (OSError, DriveError) as error:
+            leftovers.append(f"{item.get('local') or item.get('remote') or item.get('from')}: {error}")
+    return leftovers
+
+
+def undo_trash_remote(item, drive, cache):
+    """Restore one item from Drive's trash, making sure it's the right one."""
+    name, uid, path = item["name"], item.get("uid"), item["remote"]
+    node = drive.info(f"{DRIVE_ROOT}/{uid}") if uid else None
+    if uid and (node is None or not node.get("trashTime")):
+        return None if node is not None else f"{path}: no longer in Drive's trash"
+    first = drive.first_in_trash(name)
+    if first is None:
+        return f"{path}: no longer in Drive's trash"
+    if first != uid:
+        if "trash" not in cache:
+            cache["trash"] = drive.list("/trash")
+        same = [n for n in cache["trash"] if (n.get("name") or {}).get("value") == name and n.get("uid") != uid]
+        choice = "m"
+        if sys.stdin.isatty():
+            print(f"\n{plural(len(same), 'other item')} named \"{name}\" are in the Drive trash ahead of yours "
+                  f"({path}).")
+            print("  [m] I'll restore it myself on drive.proton.me   (default)")
+            print("  [s] Move the others aside, restore mine, then put them back in the trash")
+            print("  [d] Permanently delete the others, then restore mine")
+            choice = ask("Choice [m/s/d]: ", ["m", "s", "d"])
+        if choice == "m":
+            return f"{path}: restore it yourself in the trash on drive.proton.me (other items have the same name)"
+        if choice == "d":
+            print("These will be deleted for good:")
+            for n in same:
+                size = n.get("totalStorageSize") or (n.get("activeRevision") or {}).get("claimedSize") or 0
+                print(f"  {name}  {n.get('type')}, {human(size)}, trashed {n.get('trashTime')}")
+            try:
+                confirm = input("Type delete to confirm: ").strip()
+            except EOFError:
+                confirm = ""
+            if confirm != "delete":
+                return f"{path}: not restored (permanent deletion wasn't confirmed). Restore it on drive.proton.me."
+            for _ in range(len(same) + 1):
+                first = drive.first_in_trash(name)
+                if first is None or first == uid:
+                    break
+                if not drive.delete_trashed(name):
+                    return f"{path}: couldn't delete the other items; restore it on drive.proton.me"
+            cache.pop("trash", None)
+        else:
+            moved = []
+            for _ in range(len(same) + 1):
+                first = drive.first_in_trash(name)
+                if first is None or first == uid:
+                    break
+                ok, text = drive.restore(name)
+                if not ok:
+                    for other in moved:
+                        drive.trash([f"{DRIVE_ROOT}/{other}"])
+                    return f"{path}: an item ahead of it couldn't be moved aside ({text}); restore it on drive.proton.me"
+                moved.append(first)
+            ok, text = drive.restore(name)
+            for other in moved:
+                drive.trash([f"{DRIVE_ROOT}/{other}"])
+            cache.pop("trash", None)
+            return None if ok else f"{path}: {text}"
+        if drive.first_in_trash(name) != uid:
+            return f"{path}: restore it yourself on drive.proton.me"
+    ok, text = drive.restore(name)
+    cache.pop("trash", None)
+    if not ok:
+        return f"{path}: {text.splitlines()[-1] if text else 'restore failed'}"
+    return None
+
+
+# edit ---------------------------------------------------------------------------------------
+
+
+def find_editor(flag):
+    for candidate in (flag, os.environ.get("VISUAL"), os.environ.get("EDITOR")):
+        if candidate:
+            return candidate
+    for name in ("nvim", "vim", "nano", "vi"):
+        if shutil.which(name):
+            return name
+    raise EzError("no editor found. Use --editor COMMAND, or set $EDITOR.")
+
+
+def cmd_edit(name, editor_flag):
+    if name is None:
+        if not sys.stdin.isatty():
+            raise UsageError("choose a file: ezproton edit backup|sync|exclude|settings")
+        for index, option in enumerate(CONFIG_FILES, 1):
+            print(f"  {index}. {option}")
+        answer = ask("Which file? [1-4]: ", ["1", "2", "3", "4"])
+        name = CONFIG_FILES[int(answer) - 1]
+    if name not in CONFIG_FILES:
+        raise UsageError(f"unknown config file \"{name}\". Choose backup, sync, exclude or settings.")
+    editor = find_editor(editor_flag)
+    path = os.path.join(CONFIG_DIR, name)
+    try:
+        with open(path) as handle:
+            original = handle.read()
+    except FileNotFoundError:
+        original = None
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f"{name}.", suffix=".edit", dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(original if original is not None else TEMPLATES[name])
+        while True:
+            status = subprocess.call(shlex.split(editor) + [tmp])
+            if status != 0:
+                raise EzError(f"the editor exited with status {status}; {name} was not changed.")
+            with open(tmp) as handle:
+                text = handle.read()
+            config = load_config({name: text})
+            issues = config.problems + (config.warnings if name == "exclude" else [])
+            if not issues:
+                break
+            print(f"{RED}{name} has problems:{RESET}")
+            for issue in issues:
+                print(f"  {issue}")
+            if not sys.stdin.isatty():
+                raise EzError(f"{name} was not changed.")
+            choice = ask("[e]dit again, [k]eep anyway, [d]iscard? [e/k/d] ", ["e", "k", "d"])
+            if choice == "d":
+                print(f"{name} was not changed.")
+                return OK
+            if choice == "k":
+                break
+        atomic_write(path, text)
+        print(f"Saved {show(path)}.")
+        return OK
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+# --------------------------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------------------------
+
+
+def main(argv):
+    if not argv:
+        print(HELP)
+        return OK
+    if argv[0] in ("-h", "--help"):
+        print(HELP)
+        return OK
+    if argv[0] == "--version":
+        print(f"ezproton {VERSION}")
+        return OK
+    command, rest = argv[0], argv[1:]
+    if command not in ("backup", "sync", "check", "preview", "last", "undo", "edit"):
+        raise UsageError(f"unknown command \"{command}\"")
+
+    flags = {"--yes": False, "--excluded": False, "--log": False}
+    editor = None
+    positional = []
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--":
+            positional.extend(rest[i + 1:])
+            break
+        if arg in ("-h", "--help"):
+            print(HELP)
+            return OK
+        if arg == "--editor":
+            if i + 1 >= len(rest):
+                raise UsageError("--editor needs a command")
+            editor = rest[i + 1]
+            i += 2
+            continue
+        if arg in flags:
+            flags[arg] = True
+        elif arg.startswith("-"):
+            raise UsageError(f"unknown option \"{arg}\"")
+        else:
+            positional.append(arg)
+        i += 1
+
+    allowed = {"backup": {"--yes"}, "sync": {"--yes"}, "check": set(), "preview": {"--excluded"},
+               "last": {"--log"}, "undo": {"--yes"}, "edit": set()}[command]
+    for flag, value in flags.items():
+        if value and flag not in allowed:
+            raise UsageError(f"{flag} doesn't apply to {command}")
+    if editor is not None and command != "edit":
+        raise UsageError("--editor only applies to edit")
+
+    if command == "edit":
+        if len(positional) > 1:
+            raise UsageError("edit takes one file name")
+        return cmd_edit(positional[0] if positional else None, editor)
+
+    if command == "undo":
+        if not positional or positional[0] != "last":
+            raise UsageError("use: ezproton undo last [backup|sync] [PATH...]")
+        positional = positional[1:]
+
+    kind = None
+    if command in ("backup", "sync"):
+        kind = command
+    elif positional and positional[0] in ("backup", "sync"):
+        kind = positional.pop(0)
+
+    if command in ("backup", "sync"):
+        return cmd_run(kind, positional, flags["--yes"])
+    if command == "check":
+        return cmd_check(kind, positional)
+    if command == "preview":
+        return cmd_preview(kind, positional, flags["--excluded"])
+    if command == "last":
+        return cmd_last(kind, positional, flags["--log"])
+    return cmd_undo(kind, positional, flags["--yes"])
+
+
+def entry_point():
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except UsageError as error:
+        print(f"ezproton: {error}", file=sys.stderr)
+        print("Run \"ezproton --help\" for the commands.", file=sys.stderr)
+        sys.exit(ERROR)
+    except EzError as error:
+        print(f"{RED}ezproton: {error}{RESET}", file=sys.stderr)
+        sys.exit(error.code)
+    except KeyboardInterrupt:
+        print("\nezproton: interrupted.", file=sys.stderr)
+        sys.exit(ERROR)
+
+
+if __name__ == "__main__":
+    entry_point()
