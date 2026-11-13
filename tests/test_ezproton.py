@@ -1146,6 +1146,72 @@ class InterruptTests(EzTestCase):
 
 
 # --------------------------------------------------------------------------------------------
+# Progress (issue #4)
+# --------------------------------------------------------------------------------------------
+
+
+class ProgressTests(EzTestCase):
+    def setUp(self):
+        super().setUp()
+        self.backup("~/Documents")
+        self.sync("~/Music : /my-files/Music")
+        for n in range(3):
+            self.mkfile(f"Documents/d{n}/file{n}.txt", "x" * (n + 1) * 1000)
+        (self.home / "Music").mkdir()
+        for n in range(3):
+            self.drive_put(f"/my-files/Music/album{n}/song{n}.mp3", "s" * 2000)
+        self.mkfile("Music/local.mp3", "L")
+
+    def test_output_without_a_terminal_has_no_control_characters(self):
+        for command in ("backup", "sync", "preview"):
+            result = self.ok(command)
+            for stream in (result.stdout, result.stderr):
+                self.assertNotIn("\r", stream)
+                self.assertNotIn("\x1b", stream)
+
+    def test_without_a_terminal_each_phase_gets_a_plain_line(self):
+        backup = self.ok("backup").stderr
+        self.assertIn("Uploading", backup)
+        sync = self.ok("sync").stderr
+        self.assertIn("Listing Drive", sync)
+        self.assertIn("Downloading", sync)
+
+    def test_quiet_shows_only_the_summary(self):
+        result = self.ok("backup", "--quiet")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("success", result.stdout)
+        self.assertEqual(self.ok("sync", "--quiet").stderr, "")
+
+    def test_quiet_is_refused_where_it_means_nothing(self):
+        self.assertEqual(self.run_ez("check", "--quiet").returncode, 1)
+
+    def test_progress_bars_in_a_terminal(self):
+        code, out = self.run_tty("sync", env={"COLUMNS": "100"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("Listing Drive", out)
+        self.assertIn("Downloading", out)
+        self.assertRegex(out, "[█░]")
+        code, out = self.run_tty("backup", env={"COLUMNS": "100"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("Uploading", out)
+        self.assertRegex(out, r"\d+(\.\d)? (B|KiB) / \d+(\.\d)? (B|KiB)")
+
+    def test_a_very_narrow_terminal_still_works(self):
+        code, out = self.run_tty("sync", env={"COLUMNS": "12"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read("Music/album0/song0.mp3"), "s" * 2000)
+
+    def test_undo_and_preview_show_progress_in_a_terminal(self):
+        code, out = self.run_tty("preview", env={"COLUMNS": "100"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("Listing Drive", out)
+        self.ok("backup")
+        code, out = self.run_tty("undo", "last", "backup", "--yes", env={"COLUMNS": "100"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("Undoing", out)
+
+
+# --------------------------------------------------------------------------------------------
 # README (issue #2)
 # --------------------------------------------------------------------------------------------
 

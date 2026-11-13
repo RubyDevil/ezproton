@@ -83,12 +83,12 @@ The Proton login is stored in your desktop keyring.
 ## Commands
 
 ```
-ezproton backup  [PATH...] [--yes]
-ezproton sync    [PATH...] [--yes]
+ezproton backup  [PATH...] [--yes] [--quiet]
+ezproton sync    [PATH...] [--yes] [--quiet]
 ezproton check   [backup|sync] [PATH...]
 ezproton preview [backup|sync] [PATH...] [--excluded]
 ezproton last    [backup|sync] [PATH...] [--log]
-ezproton undo last [backup|sync] [PATH...] [--yes]
+ezproton undo last [backup|sync] [PATH...] [--yes] [--quiet]
 ezproton edit    [backup|sync|exclude|settings] [--editor COMMAND]
 ezproton --help | --version
 ```
@@ -112,6 +112,22 @@ Relative paths work and are resolved from the current folder, so `cd ~/Music && 
 works. A path that matches nothing is an error that lists what's configured. A path from the wrong
 list is an error that says so, for example `ezproton backup ~/Music` when `~/Music` is a sync pair.
 `--` ends the options, so the path arguments after it may start with `-`.
+
+**Progress:** in a terminal, `backup`, `sync`, `preview` and `undo` show each step as it happens,
+with progress bars where the total is known:
+
+```
+sync ~/Music  →  /my-files/Music: checking
+  Scanning laptop   [████████████████████] 12340 files
+  Listing Drive     [██████████░░░░░░░░░░] 248/500 folders  ·  1 min 10 s left
+sync ~/Music: running
+  Uploading         [███████░░░░░░░░░░░░░] 1.2 GiB / 3.4 GiB  ·  14/37 files  ·  2 min 5 s left
+```
+
+`proton-drive` sends a whole batch of files in one go, so a bar moves when a batch finishes;
+in between, the elapsed time keeps counting. Without a terminal (a timer, or `| tee`), each step
+gets one plain line instead, with no bars or redrawing. **`--quiet`** shows only errors and the
+final summary.
 
 **`--yes`** lets a run go ahead when it would delete more than the deletion limit (see
 [Safety](#safety)).
@@ -363,8 +379,8 @@ Description=ezproton backup and sync
 
 [Service]
 Type=oneshot
-ExecStart=ezproton backup
-ExecStart=ezproton sync
+ExecStart=ezproton backup --quiet
+ExecStart=ezproton sync --quiet
 ```
 
 `~/.config/systemd/user/ezproton.timer`

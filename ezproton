@@ -19,18 +19,19 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 
 VERSION = "0.1.0"
 USAGE = """Usage:
-  ezproton backup  [PATH...] [--yes]
-  ezproton sync    [PATH...] [--yes]
+  ezproton backup  [PATH...] [--yes] [--quiet]
+  ezproton sync    [PATH...] [--yes] [--quiet]
   ezproton check   [backup|sync] [PATH...]
   ezproton preview [backup|sync] [PATH...] [--excluded]
   ezproton last    [backup|sync] [PATH...] [--log]
-  ezproton undo last [backup|sync] [PATH...] [--yes]
+  ezproton undo last [backup|sync] [PATH...] [--yes] [--quiet]
   ezproton edit    [backup|sync|exclude|settings] [--editor COMMAND]
   ezproton --help | --version"""
 
@@ -58,6 +59,7 @@ Options:
                     before undoing
   --excluded        preview: also list every skipped path and why
   --log             last: print the full output of the last run
+  --quiet           backup, sync, undo: no progress, only the summary and errors
   --editor COMMAND  edit: the editor to use (default: $VISUAL, $EDITOR, then
                     nvim, vim, nano or vi)
   -h, --help        Show this help
@@ -240,6 +242,193 @@ def ask(prompt, choices):
             return choices[0]
         if answer in choices:
             return answer
+
+
+# --------------------------------------------------------------------------------------------
+# Progress
+# --------------------------------------------------------------------------------------------
+
+
+class Phase:
+    """One step of a run, such as "Listing Drive", with a count and optionally bytes."""
+
+    def __init__(self, progress, label, total=None, total_bytes=None, unit="files"):
+        self.progress, self.label, self.unit = progress, label, unit
+        self.total, self.total_bytes = total, total_bytes
+        self.done = self.done_bytes = 0
+        self.started = time.time()
+        self.last_plain = self.started
+        self.lock = threading.Lock()
+
+    def advance(self, count=1, nbytes=0):
+        with self.lock:
+            self.done += count
+            self.done_bytes += nbytes
+        self.progress.tick(self)
+
+    def grow(self, count=0, nbytes=0):
+        with self.lock:
+            self.total = (self.total or 0) + count
+            if nbytes:
+                self.total_bytes = (self.total_bytes or 0) + nbytes
+        self.progress.tick(self)
+
+    def finish(self, summary=None):
+        self.progress.end(self, summary)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        self.finish(None if kind is None else "stopped")
+
+    def detail(self, final=False):
+        with self.lock:
+            done, total, done_bytes, total_bytes = self.done, self.total, self.done_bytes, self.total_bytes
+        elapsed = time.time() - self.started
+        parts = []
+        if total_bytes:
+            parts.append(f"{human(done_bytes)} / {human(total_bytes)}")
+        if total:
+            parts.append(f"{done}/{total} {self.unit}")
+        else:
+            unit = self.unit[:-1] if done == 1 and self.unit.endswith("s") else self.unit
+            parts.append(f"{done} {unit}")
+        if not final and elapsed > 2:
+            if total_bytes and done_bytes:
+                remaining = elapsed * (total_bytes - done_bytes) / done_bytes
+                parts.append(f"{duration(remaining)} left")
+            elif total and done:
+                parts.append(f"{duration(elapsed * (total - done) / done)} left")
+            else:
+                parts.append(duration(elapsed))
+        if final and elapsed >= 1:
+            parts.append(f"took {duration(elapsed)}")
+        return "  ·  ".join(parts)
+
+    def fraction(self):
+        with self.lock:
+            if self.total_bytes:
+                return min(1.0, self.done_bytes / self.total_bytes)
+            if self.total:
+                return min(1.0, self.done / self.total)
+        return None
+
+
+class Progress:
+    """Progress on stderr. In a terminal: one live line with a bar, redrawn in place.
+    Otherwise: a plain line per finished phase (and one a minute for long phases).
+    Quiet: nothing."""
+
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, mode="plain"):
+        self.mode = mode
+        self.current = None
+        self.lock = threading.RLock()
+        self.spin = 0
+        self.ticker = None
+
+    def header(self, text):
+        if self.mode == "quiet":
+            return
+        with self.lock:
+            self.clear()
+            print(f"{BOLD}{text}{RESET}" if self.mode == "tty" else text, file=sys.stderr, flush=True)
+
+    def phase(self, label, total=None, total_bytes=None, unit="files"):
+        phase = Phase(self, label, total, total_bytes, unit)
+        with self.lock:
+            self.current = phase
+        if self.mode == "tty" and self.ticker is None:
+            self.ticker = threading.Thread(target=self._tick_loop, daemon=True)
+            self.ticker.start()
+        self.tick(phase, now=True)
+        return phase
+
+    def _tick_loop(self):
+        while True:
+            time.sleep(0.2)
+            with self.lock:
+                if self.current is not None:
+                    self.spin += 1
+                    self.draw(self.current)
+
+    def tick(self, phase, now=False):
+        if self.mode == "tty":
+            if now:
+                with self.lock:
+                    if phase is self.current:
+                        self.draw(phase)
+        elif self.mode == "plain" and time.time() - phase.last_plain >= 60:
+            phase.last_plain = time.time()
+            print(f"  {phase.label}: {phase.detail()}", file=sys.stderr, flush=True)
+
+    def width(self):
+        return max(10, shutil.get_terminal_size((80, 24)).columns)
+
+    def draw(self, phase, final=False):
+        columns = self.width()
+        label = f"  {phase.label:<17} "
+        fraction = 1.0 if final else phase.fraction()
+        if fraction is None:
+            bar = self.SPINNER[self.spin % len(self.SPINNER)] + " "
+        else:
+            size = max(4, min(20, columns - len(label) - 30))
+            filled = int(round(fraction * size))
+            bar = "[" + "█" * filled + "░" * (size - filled) + "] "
+        line = (label + bar + phase.detail(final))[: columns - 1]
+        sys.stderr.write("\r\033[2K" + line + ("\n" if final else ""))
+        sys.stderr.flush()
+
+    def clear(self):
+        if self.mode == "tty" and self.current is not None:
+            sys.stderr.write("\r\033[2K")
+            sys.stderr.flush()
+
+    def end(self, phase, summary=None):
+        with self.lock:
+            if phase is self.current:
+                self.current = None
+            if self.mode == "tty":
+                if summary:
+                    sys.stderr.write("\r\033[2K" + f"  {phase.label:<17} {summary}"[: self.width() - 1] + "\n")
+                    sys.stderr.flush()
+                else:
+                    self.draw(phase, final=True)
+            elif self.mode == "plain":
+                print(f"  {phase.label}: {summary or phase.detail(final=True)}", file=sys.stderr, flush=True)
+
+    def pause(self):
+        """Hide the live line while a prompt is on screen."""
+        with self.lock:
+            self.clear()
+            saved, self.current = self.current, None
+        return saved
+
+    def resume(self, saved):
+        with self.lock:
+            self.current = saved
+
+    def say(self, text):
+        """A line printed by the program while a phase may be on screen."""
+        with self.lock:
+            self.clear()
+            print(text, flush=True)
+            if self.mode == "tty" and self.current is not None:
+                self.draw(self.current)
+
+
+PROGRESS = Progress("plain")
+
+
+def duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60} s"
+    return f"{seconds // 3600} h {seconds % 3600 // 60} min"
 
 
 # --------------------------------------------------------------------------------------------
@@ -661,12 +850,14 @@ class Drive:
     def walk(self, base):
         """Everything below a Drive folder as {rel: Remote}, listing folders in parallel."""
         found = {}
-        with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
+        with PROGRESS.phase("Listing Drive", total=1, unit="folders") as phase, \
+                concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
             pending = {pool.submit(self.list, base): ""}
             while pending:
                 done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
                     prefix = pending.pop(future)
+                    phase.advance()
                     for item in future.result():
                         name = (item.get("name") or {}).get("value")
                         if not (item.get("name") or {}).get("ok", True) or not name:
@@ -675,6 +866,7 @@ class Drive:
                         if item.get("type") == "folder":
                             found[rel] = Remote(rel, "dir", item.get("uid", ""))
                             pending[pool.submit(self.list, f"{DRIVE_ROOT}/{item['uid']}")] = rel
+                            phase.grow(1)
                         elif item.get("type") == "file":
                             rev = item.get("activeRevision") or {}
                             found[rel] = Remote(
@@ -757,6 +949,8 @@ def scan_local(root, config, single_file=False):
                     walk(entry.path, child)
                 elif entry.is_file(follow_symlinks=False):
                     info = entry.stat(follow_symlinks=False)
+                    if PROGRESS.current is not None:
+                        PROGRESS.current.advance()
                     if os.access(entry.path, os.R_OK):
                         scan.entries[child] = Local(child, "file", info.st_size, info.st_mtime_ns)
                     else:
@@ -769,7 +963,8 @@ def scan_local(root, config, single_file=False):
                 scan.unreadable[child] = error.strerror or "can't be read"
                 scan.mark_dirty(child)
 
-    walk(root, "")
+    with PROGRESS.phase("Scanning laptop"):
+        walk(root, "")
     return scan
 
 
@@ -1057,7 +1252,10 @@ def plan_sync(entry, config, drive):
         return hashes[rel]
 
     actions, trash_remote, trash_local = [], [], []
-    for rel in sorted(set(local) | set(remote) | set(state)):
+    names = sorted(set(local) | set(remote) | set(state))
+    comparing = PROGRESS.phase("Comparing", total=len(names), unit="items")
+    for rel in names:
+        comparing.advance()
         if protected(rel):
             continue
         l, r, s = local.get(rel), remote.get(rel), state.get(rel)
@@ -1103,6 +1301,8 @@ def plan_sync(entry, config, drive):
                 actions.append(Action("download", rel, new=True, remote=r))
             else:
                 trash_remote.append(rel)
+
+    comparing.finish()
 
     # A folder is trashed whole only when nothing inside it is kept; otherwise it's recreated.
     kept = {a.rel for a in actions}
@@ -1259,8 +1459,27 @@ def run_backup(plan, config, drive, outcome):
             return items, failed, set(sources)
 
         if batches:
-            with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
-                results = list(pool.map(do_batch, list(batches)))
+            def batch_size(key):
+                files = nbytes = 0
+                for action in batches[key]:
+                    if action.op == "upload_dir":
+                        inside = [e for r, e in scan.entries.items() if is_under(r, action.rel) and e.type == "file"]
+                        files += len(inside)
+                        nbytes += sum(e.size for e in inside)
+                    else:
+                        files += 1
+                        nbytes += action.local.size
+                return files, nbytes
+
+            sizes = {key: batch_size(key) for key in batches}
+            results = []
+            with PROGRESS.phase("Uploading", total=sum(f for f, _ in sizes.values()),
+                                total_bytes=sum(b for _, b in sizes.values())) as phase, \
+                    concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+                futures = {pool.submit(do_batch, key): key for key in batches}
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+                    phase.advance(*sizes[futures[future]])
             for items, failed, sources in results:
                 for action in items:
                     path = rel_join(local_base, action.rel)
@@ -1321,6 +1540,7 @@ def run_backup(plan, config, drive, outcome):
                 node = drive.info(path)
                 return path, node.get("uid") if node else None
 
+            trashing = PROGRESS.phase("Trashing on Drive", total=len(targets), unit="items")
             with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
                 uids = dict(pool.map(uid_for, targets.items()))
             existing = {f"{DRIVE_ROOT}/{uids[p]}": p for p in targets if uids.get(p)}
@@ -1335,6 +1555,8 @@ def run_backup(plan, config, drive, outcome):
                     outcome.trashed_remote += action.count
                     outcome.add({"op": "trash_remote", "remote": path, "uid": uid,
                                             "name": os.path.basename(action.rel)})
+            trashing.advance(len(targets))
+            trashing.finish()
     except BaseException:
         save_manifest()
         raise
@@ -1434,9 +1656,26 @@ def run_sync(plan, config, drive, outcome):
 
         uploaded = []
         if groups:
-            with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
-                for done in pool.map(do_upload, list(groups)):
-                    uploaded.extend(done)
+            def group_size(parent):
+                files = nbytes = 0
+                for kind, rel, item, _ in groups[parent]:
+                    if kind == "dir":
+                        inside = [e for r, e in scan.entries.items() if is_under(r, rel) and e.type == "file"]
+                        files += len(inside)
+                        nbytes += sum(e.size for e in inside)
+                    else:
+                        files += 1
+                        nbytes += item.size
+                return files, nbytes
+
+            sizes = {parent: group_size(parent) for parent in groups}
+            with PROGRESS.phase("Uploading", total=sum(f for f, _ in sizes.values()),
+                                total_bytes=sum(b for _, b in sizes.values())) as phase, \
+                    concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+                futures = {pool.submit(do_upload, parent): parent for parent in groups}
+                for future in concurrent.futures.as_completed(futures):
+                    uploaded.extend(future.result())
+                    phase.advance(*sizes[futures[future]])
         if uploaded:
             # Learn the new revisions, and check that Drive has what was hashed.
             folders = sorted({parent_rel(rel) for kind, rel, _, _ in uploaded if kind == "file"})
@@ -1483,6 +1722,10 @@ def run_sync(plan, config, drive, outcome):
         dir_downloads = [a for a in actions if a.op == "download_dir"]
         if downloads or dir_downloads:
             os.makedirs(tmp_root, exist_ok=True)
+            in_dirs = [r for a in dir_downloads for rel, r in remote.items()
+                       if is_under(rel, a.rel) and rel != a.rel and r.type == "file"]
+            downloading = PROGRESS.phase("Downloading", total=len(downloads) + len(in_dirs),
+                                         total_bytes=sum(a.remote.size for a in downloads) + sum(r.size for r in in_dirs))
             try:
                 by_parent = {}
                 for action in downloads:
@@ -1494,6 +1737,7 @@ def run_sync(plan, config, drive, outcome):
                     for action in group:
                         place_download(action, os.path.join(staging, os.path.basename(action.rel)),
                                        lpath(action.rel), outcome, remember, ok)
+                    downloading.advance(len(group), sum(a.remote.size for a in group))
                 for index, action in enumerate(dir_downloads):
                     staging = os.path.join(tmp_root, f"d{index}")
                     os.makedirs(staging)
@@ -1526,11 +1770,17 @@ def run_sync(plan, config, drive, outcome):
                         count += 1
                     outcome.downloaded += count
                     outcome.add({"op": "download_new", "local": target, "dir": True})
+                    inside = [r for rel, r in remote.items() if is_under(rel, action.rel) and r.type == "file"]
+                    downloading.advance(len(inside), sum(r.size for r in inside))
             finally:
+                downloading.finish()
                 shutil.rmtree(tmp_root, ignore_errors=True)
 
         # 5. Deletions.
         remote_trash = [a for a in actions if a.op == "trash_remote"]
+        local_trash = [a for a in actions if a.op == "trash_local"]
+        trashing = PROGRESS.phase("Trashing", total=len(remote_trash) + len(local_trash), unit="items") \
+            if remote_trash or local_trash else None
         if remote_trash:
             paths = [f"{DRIVE_ROOT}/{a.remote.uid}" if a.remote and a.remote.uid else rpath(a.rel) for a in remote_trash]
             failed = set(drive.trash(paths))
@@ -1543,7 +1793,9 @@ def run_sync(plan, config, drive, outcome):
                                         "uid": action.remote.uid if action.remote else "",
                                         "name": os.path.basename(action.rel)})
                 forget(action.rel)
-        for action in (a for a in actions if a.op == "trash_local"):
+            trashing.advance(len(remote_trash))
+        for action in local_trash:
+            trashing.advance()
             path = lpath(action.rel)
             if action.local and action.local.type == "file" and not stat_matches(path, action.local.size, action.local.mtime_ns):
                 outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
@@ -1556,6 +1808,8 @@ def run_sync(plan, config, drive, outcome):
             outcome.trashed_local += action.count
             outcome.add({"op": "trash_local", "local": path, "trashed": record})
             forget(action.rel)
+        if trashing:
+            trashing.finish()
     except BaseException:
         save_state(entry, new_state)
         raise
@@ -1781,6 +2035,7 @@ def cmd_run(kind, paths, yes):
         preflight(config, backups if kind == "backup" else [], pairs if kind == "sync" else [], drive, True)
         plans = []
         for entry in entries:
+            PROGRESS.header(f"{kind} {show(entry.local)}  →  {entry.remote}: checking")
             plans.append(plan_backup(entry, config, drive) if kind == "backup" else plan_sync(entry, config, drive))
         total = sum(p.deletions for p in plans)
         if total > config.delete_limit and not yes:
@@ -1799,6 +2054,8 @@ def cmd_run(kind, paths, yes):
             outcome = Outcome()
             entry_drive = Drive()
             start_record(entry, started, outcome, prev)
+            if plan.actions:
+                PROGRESS.header(f"{kind} {show(entry.local)}: running")
             try:
                 (run_backup if kind == "backup" else run_sync)(plan, config, entry_drive, outcome)
             except EzError as error:
@@ -1918,6 +2175,7 @@ def cmd_preview(kind, paths, excluded):
     preflight(config, backups, pairs, drive, True)
     total_backup = total_sync = 0
     for entry in backups:
+        PROGRESS.header(f"backup {show(entry.local)}: checking")
         plan = plan_backup(entry, config, drive)
         print_plan(plan, config)
         total_backup += plan.deletions
@@ -1925,6 +2183,7 @@ def cmd_preview(kind, paths, excluded):
             print_excluded(plan)
         print()
     for pair in pairs:
+        PROGRESS.header(f"sync {show(pair.local)}: checking")
         plan = plan_sync(pair, config, drive)
         print_plan(plan, config)
         total_sync += plan.deletions
@@ -2042,7 +2301,9 @@ def cmd_undo(kind, paths, yes):
 def undo_record(entry, record, journal, drive):
     leftovers = []
     trash_cache = {}
+    undoing = PROGRESS.phase("Undoing", total=len(journal), unit="actions")
     for item in reversed(journal):
+        undoing.advance()
         op = item["op"]
         try:
             if op == "upload_new":
@@ -2113,6 +2374,7 @@ def undo_record(entry, record, journal, drive):
                     os.rename(item["to"], item["from"])
         except (OSError, DriveError) as error:
             leftovers.append(f"{item.get('local') or item.get('remote') or item.get('from')}: {error}")
+    undoing.finish()
     return leftovers
 
 
@@ -2130,6 +2392,7 @@ def undo_trash_remote(item, drive, cache):
             cache["trash"] = drive.list("/trash")
         same = [n for n in cache["trash"] if (n.get("name") or {}).get("value") == name and n.get("uid") != uid]
         choice = "m"
+        paused = PROGRESS.pause()
         if sys.stdin.isatty():
             print(f"\n{plural(len(same), 'other item')} named \"{name}\" are in the Drive trash ahead of yours "
                   f"({path}).")
@@ -2137,6 +2400,8 @@ def undo_trash_remote(item, drive, cache):
             print("  [s] Move the others aside, restore mine, then put them back in the trash")
             print("  [d] Permanently delete the others, then restore mine")
             choice = ask("Choice [m/s/d]: ", ["m", "s", "d"])
+        if choice != "d":
+            PROGRESS.resume(paused)
         if choice == "m":
             return f"{path}: restore it yourself in the trash on drive.proton.me (other items have the same name)"
         if choice == "d":
@@ -2148,6 +2413,7 @@ def undo_trash_remote(item, drive, cache):
                 confirm = input("Type delete to confirm: ").strip()
             except EOFError:
                 confirm = ""
+            PROGRESS.resume(paused)
             if confirm != "delete":
                 return f"{path}: not restored (permanent deletion wasn't confirmed). Restore it on drive.proton.me."
             for _ in range(len(same) + 1):
@@ -2266,7 +2532,7 @@ def main(argv):
     if command not in ("backup", "sync", "check", "preview", "last", "undo", "edit"):
         raise UsageError(f"unknown command \"{command}\"")
 
-    flags = {"--yes": False, "--excluded": False, "--log": False}
+    flags = {"--yes": False, "--excluded": False, "--log": False, "--quiet": False}
     editor = None
     positional = []
     i = 0
@@ -2292,13 +2558,21 @@ def main(argv):
             positional.append(arg)
         i += 1
 
-    allowed = {"backup": {"--yes"}, "sync": {"--yes"}, "check": set(), "preview": {"--excluded"},
-               "last": {"--log"}, "undo": {"--yes"}, "edit": set()}[command]
+    allowed = {"backup": {"--yes", "--quiet"}, "sync": {"--yes", "--quiet"}, "check": set(),
+               "preview": {"--excluded"}, "last": {"--log"}, "undo": {"--yes", "--quiet"}, "edit": set()}[command]
     for flag, value in flags.items():
         if value and flag not in allowed:
             raise UsageError(f"{flag} doesn't apply to {command}")
     if editor is not None and command != "edit":
         raise UsageError("--editor only applies to edit")
+    if flags["--quiet"]:
+        PROGRESS.mode = "quiet"
+    elif sys.stderr.isatty() and command in ("backup", "sync", "preview", "undo", "check"):
+        PROGRESS.mode = "tty"
+    elif command in ("backup", "sync", "preview", "undo"):
+        PROGRESS.mode = "plain"
+    else:
+        PROGRESS.mode = "quiet"
 
     if command == "edit":
         if len(positional) > 1:
