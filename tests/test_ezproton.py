@@ -1072,6 +1072,80 @@ class EditTests(EzTestCase):
 
 
 # --------------------------------------------------------------------------------------------
+# Interrupted runs (issue #3)
+# --------------------------------------------------------------------------------------------
+
+
+def signal_on(command, signal_name):
+    """A FAKE_PD_HOOK that signals ezproton when it calls `proton-drive filesystem <command>`."""
+    return f'case " $* " in *" {command} "*) kill -{signal_name} "$FAKE_PD_PARENT"; sleep 3;; esac'
+
+
+class InterruptTests(EzTestCase):
+    def setUp(self):
+        super().setUp()
+        self.backup("~/Documents")
+        self.root = f"{BACKUP_ROOT}/Documents"
+        self.mkfile("Documents/a.txt", "A")
+        self.mkfile("Documents/b.txt", "B")
+        self.ok("backup")
+        # Next run: upload c.txt, then trash b.txt (interrupted there).
+        self.mkfile("Documents/c.txt", "C")
+        (self.home / "Documents/b.txt").unlink()
+
+    def test_interrupted_backup_is_recorded_as_interrupted(self):
+        result = self.run_ez("backup", env={"FAKE_PD_HOOK": signal_on("trash", "TERM")})
+        self.assertEqual(result.returncode, 130, result.stdout + result.stderr)
+        self.assertIn("interrupted", (result.stdout + result.stderr).lower())
+        self.assertIn("interrupted", self.ok("last", "backup").stdout.lower())
+
+    def test_ctrl_c_is_handled_the_same_way(self):
+        result = self.run_ez("backup", env={"FAKE_PD_HOOK": signal_on("trash", "INT")})
+        self.assertEqual(result.returncode, 130)
+        self.assertIn("interrupted", self.ok("last", "backup").stdout.lower())
+
+    def test_undo_reverses_the_finished_part_of_an_interrupted_run(self):
+        self.run_ez("backup", env={"FAKE_PD_HOOK": signal_on("trash", "TERM")})
+        self.assertEqual(self.drive_read(f"{self.root}/c.txt"), "C")
+        self.ok("undo", "last", "backup", "--yes")
+        self.assertFalse(self.drive_exists(f"{self.root}/c.txt"))
+        self.assertTrue(self.drive_exists(f"{self.root}/b.txt"))
+
+    def test_next_run_finishes_without_redoing_the_finished_part(self):
+        self.run_ez("backup", env={"FAKE_PD_HOOK": signal_on("trash", "TERM")})
+        self.clear_calls()
+        self.ok("backup")
+        self.assertEqual(self.calls_of("upload"), [])
+        self.assertFalse(self.drive_exists(f"{self.root}/b.txt"))
+        self.assertIn("b.txt", self.drive_trash_names())
+
+    def test_a_killed_run_can_still_be_undone(self):
+        # SIGKILL can't be caught: what was done must already be on disk.
+        result = self.run_ez("backup", env={"FAKE_PD_HOOK": signal_on("trash", "KILL")})
+        self.assertEqual(result.returncode, -9)
+        self.assertIn("didn't finish", self.ok("last", "backup").stdout)
+        self.ok("undo", "last", "backup", "--yes")
+        self.assertFalse(self.drive_exists(f"{self.root}/c.txt"))
+
+    def test_interrupted_sync_keeps_what_it_finished(self):
+        self.sync("~/Music : /my-files/Music")
+        self.mkfile("Music/a.mp3", "a1")
+        self.mkfile("Music/b.mp3", "b1")
+        self.ok("sync")
+        self.mkfile("Music/a.mp3", "a2 laptop", mtime=time.time() + 5)
+        self.drive_put("/my-files/Music/b.mp3", "b2 drive")
+        result = self.run_ez("sync", env={"FAKE_PD_HOOK": signal_on("download", "TERM")})
+        self.assertEqual(result.returncode, 130)
+        self.assertEqual(self.drive_read("/my-files/Music/a.mp3"), "a2 laptop")
+        self.assertFalse((self.home / "Music" / ".ezproton-tmp").exists())
+        self.clear_calls()
+        self.ok("sync")
+        self.assertEqual(self.calls_of("upload"), [])
+        self.assertEqual(self.read("Music/b.mp3"), "b2 drive")
+        self.assertEqual(sorted(p.name for p in (self.home / "Music").iterdir()), ["a.mp3", "b.mp3"])
+
+
+# --------------------------------------------------------------------------------------------
 # README (issue #2)
 # --------------------------------------------------------------------------------------------
 
@@ -1304,7 +1378,8 @@ def fake_main(argv):
         log.write(json.dumps(argv) + "\n")
     hook = os.environ.get("FAKE_PD_HOOK")
     if hook:
-        subprocess.run(["sh", "-c", hook, "hook", *argv])
+        # FAKE_PD_PARENT is ezproton's process ID, so a hook can signal it.
+        subprocess.run(["sh", "-c", hook, "hook", *argv], env=dict(os.environ, FAKE_PD_PARENT=str(os.getppid())))
     for rule in filter(None, os.environ.get("FAKE_PD_SLOW", "").split(",")):
         command, _, seconds = rule.partition("=")
         if argv[1:2] == [command] or argv[:1] == [command]:

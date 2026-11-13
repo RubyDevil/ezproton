@@ -72,7 +72,7 @@ Files:
 
 Exit status:
   0 success, 1 error, 2 partial (some items skipped or left for you),
-  3 stopped by the deletion limit (repeat with --yes)
+  3 stopped by the deletion limit (repeat with --yes), 130 interrupted
 
 Environment:
   NO_COLOR               Set to disable colors
@@ -112,6 +112,22 @@ class EzError(Exception):
 
 class UsageError(EzError):
     pass
+
+
+class Interrupted(BaseException):
+    """Ctrl-C or SIGTERM: stop cleanly, saving what was finished."""
+
+
+INTERRUPTED = 130
+_signals = 0
+
+
+def _on_signal(signum, frame):
+    global _signals
+    _signals += 1
+    if _signals > 1:
+        os._exit(INTERRUPTED)   # a second Ctrl-C quits immediately
+    raise Interrupted(signum)
 
 
 # --------------------------------------------------------------------------------------------
@@ -833,6 +849,18 @@ def save_state(entry, items):
     atomic_write(state_path(entry), json.dumps({"local": entry.local, "items": items}))
 
 
+def lock_is_held():
+    try:
+        with open(os.path.join(STATE_DIR, "lock")) as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 class Lock:
     def __enter__(self):
         os.makedirs(STATE_DIR, exist_ok=True)
@@ -1136,6 +1164,7 @@ def excluded_path(rel, config):
 @dataclass
 class Outcome:
     journal: list = field(default_factory=list)
+    journal_path: str = None
     uploaded: int = 0
     downloaded: int = 0
     trashed_remote: int = 0
@@ -1147,6 +1176,13 @@ class Outcome:
     @property
     def partial(self):
         return bool(self.skipped or self.failed)
+
+    def add(self, item):
+        """Record one finished action, on disk straight away, so undo works even after a crash."""
+        self.journal.append(item)
+        if self.journal_path:
+            with open(self.journal_path, "a") as handle:
+                handle.write(json.dumps(item) + "\n")
 
 
 def run_backup(plan, config, drive, outcome):
@@ -1166,136 +1202,143 @@ def run_backup(plan, config, drive, outcome):
     def rpath(rel):
         return drive_join(remote_base, *rel.split("/")) if rel else remote_base
 
-    drive.mkdirs(config.backup_root)
-    whole = any(a.op == "upload_dir" and a.rel == "" for a in actions)
-    root_existed = drive.info(remote_base) is not None if not single else True
-    if not whole and not single:
-        drive.mkdirs(remote_base)
+    trashed = set()
 
-    # Folders first, top-down.
-    for action in sorted((a for a in actions if a.op == "mkdir_remote"), key=lambda a: a.rel.count("/")):
-        if drive.info(rpath(action.rel)) is None:
-            drive.create_folder(rpath(parent_rel(action.rel)), os.path.basename(action.rel))
-            outcome.journal.append({"op": "mkdir_remote", "remote": rpath(action.rel)})
-        confirmed[action.rel] = {"type": "dir"}
+    def save_manifest():
+        # The new record of what is on Drive.
+        new = {}
+        for rel, item in scan.entries.items():
+            if rel in confirmed:
+                new[rel] = confirmed[rel]
+            elif rel in manifest:
+                new[rel] = {"type": "dir"} if item.type == "dir" else manifest[rel]
+        # Anything not confirmed as trashed stays on record, so a deletion that didn't happen
+        # (interrupted, or the trash call failed) is tried again next run.
+        for rel, record in manifest.items():
+            if rel not in new and not any(is_under(rel, t) for t in trashed):
+                new[rel] = record
+        save_state(entry, new)
 
-    # Uploads, grouped by Drive folder.
-    batches = {}
-    for action in actions:
-        if action.op == "upload_dir" and action.rel == "":
-            batches.setdefault(("", "root"), []).append(action)
-        elif action.op in ("upload", "upload_dir"):
-            batches.setdefault((parent_rel(action.rel), "in"), []).append(action)
+    try:
+        drive.mkdirs(config.backup_root)
+        whole = any(a.op == "upload_dir" and a.rel == "" for a in actions)
+        root_existed = drive.info(remote_base) is not None if not single else True
+        if not whole and not single:
+            drive.mkdirs(remote_base)
 
-    def do_batch(key):
-        parent, how = key
-        items = batches[key]
-        if how == "root":
-            ok, failed = drive.upload([entry.local], config.backup_root)
-            return items, failed, {entry.local}
-        sources = []
-        for action in items:
-            path = rel_join(local_base, action.rel)
-            if action.op == "upload" and not stat_matches(path, action.local.size, action.local.mtime_ns):
-                continue
-            sources.append(path)
-        if not sources:
-            return items, set(), set()
-        ok, failed = drive.upload(sources, rpath(parent))
-        return items, failed, set(sources)
+        # Folders first, top-down.
+        for action in sorted((a for a in actions if a.op == "mkdir_remote"), key=lambda a: a.rel.count("/")):
+            if drive.info(rpath(action.rel)) is None:
+                drive.create_folder(rpath(parent_rel(action.rel)), os.path.basename(action.rel))
+                outcome.add({"op": "mkdir_remote", "remote": rpath(action.rel)})
+            confirmed[action.rel] = {"type": "dir"}
 
-    if batches:
-        with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
-            results = list(pool.map(do_batch, list(batches)))
-        for items, failed, sources in results:
+        # Uploads, grouped by Drive folder.
+        batches = {}
+        for action in actions:
+            if action.op == "upload_dir" and action.rel == "":
+                batches.setdefault(("", "root"), []).append(action)
+            elif action.op in ("upload", "upload_dir"):
+                batches.setdefault((parent_rel(action.rel), "in"), []).append(action)
+
+        def do_batch(key):
+            parent, how = key
+            items = batches[key]
+            if how == "root":
+                ok, failed = drive.upload([entry.local], config.backup_root)
+                return items, failed, {entry.local}
+            sources = []
             for action in items:
                 path = rel_join(local_base, action.rel)
-                if action.op == "upload_dir":
-                    inside = {r: e for r, e in scan.entries.items() if is_under(r, action.rel)}
-                    if failed:
-                        unconfirmed.update(inside)
-                        names = sorted(n for n in failed if n != "*")
-                        for name in names:
-                            matches = [r for r, e in inside.items() if e.type == "file" and os.path.basename(r) == name]
-                            for r in matches or [name]:
-                                outcome.failed.append(f"{show(rel_join(local_base, r))} (upload failed)")
-                        if not names:
-                            outcome.failed.append(f"{show(path)} (upload failed)")
+                if action.op == "upload" and not stat_matches(path, action.local.size, action.local.mtime_ns):
+                    continue
+                sources.append(path)
+            if not sources:
+                return items, set(), set()
+            ok, failed = drive.upload(sources, rpath(parent))
+            return items, failed, set(sources)
+
+        if batches:
+            with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+                results = list(pool.map(do_batch, list(batches)))
+            for items, failed, sources in results:
+                for action in items:
+                    path = rel_join(local_base, action.rel)
+                    if action.op == "upload_dir":
+                        inside = {r: e for r, e in scan.entries.items() if is_under(r, action.rel)}
+                        if failed:
+                            unconfirmed.update(inside)
+                            names = sorted(n for n in failed if n != "*")
+                            for name in names:
+                                matches = [r for r, e in inside.items() if e.type == "file" and os.path.basename(r) == name]
+                                for r in matches or [name]:
+                                    outcome.failed.append(f"{show(rel_join(local_base, r))} (upload failed)")
+                            if not names:
+                                outcome.failed.append(f"{show(path)} (upload failed)")
+                            continue
+                        for r, e in inside.items():
+                            record = {"type": e.type}
+                            if e.type == "file":
+                                file_path = rel_join(local_base, r)
+                                if not stat_matches(file_path, e.size, e.mtime_ns):
+                                    unconfirmed.add(r)
+                                    outcome.skipped.append(f"{show(file_path)} (changed during the upload; will be uploaded again)")
+                                    continue
+                                record.update(size=e.size, mtime_ns=e.mtime_ns, sha1=sha1_of(file_path))
+                            confirmed[r] = record
+                        outcome.uploaded += action.count
+                        if action.rel or not root_existed:
+                            outcome.add({"op": "upload_new", "remote": rpath(action.rel), "dir": True})
                         continue
-                    for r, e in inside.items():
-                        record = {"type": e.type}
-                        if e.type == "file":
-                            file_path = rel_join(local_base, r)
-                            if not stat_matches(file_path, e.size, e.mtime_ns):
-                                unconfirmed.add(r)
-                                outcome.skipped.append(f"{show(file_path)} (changed during the upload; will be uploaded again)")
-                                continue
-                            record.update(size=e.size, mtime_ns=e.mtime_ns, sha1=sha1_of(file_path))
-                        confirmed[r] = record
-                    outcome.uploaded += action.count
-                    if action.rel or not root_existed:
-                        outcome.journal.append({"op": "upload_new", "remote": rpath(action.rel), "dir": True})
-                    continue
-                if path not in sources:
-                    unconfirmed.add(action.rel)
-                    outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
-                    continue
-                if os.path.basename(path) in failed or "*" in failed:
-                    unconfirmed.add(action.rel)
-                    outcome.failed.append(f"{show(path)} (upload failed)")
-                    continue
-                if not stat_matches(path, action.local.size, action.local.mtime_ns):
-                    unconfirmed.add(action.rel)
-                    outcome.skipped.append(f"{show(path)} (changed during the upload; will be uploaded again)")
-                    continue
-                digest = sha1_of(path)
-                confirmed[action.rel] = {"type": "file", "size": action.local.size,
-                                         "mtime_ns": action.local.mtime_ns, "sha1": digest}
-                outcome.uploaded += 1
-                outcome.journal.append({"op": "upload_new" if action.new else "upload_version",
-                                        "remote": rpath(action.rel), "sha1": digest})
+                    if path not in sources:
+                        unconfirmed.add(action.rel)
+                        outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
+                        continue
+                    if os.path.basename(path) in failed or "*" in failed:
+                        unconfirmed.add(action.rel)
+                        outcome.failed.append(f"{show(path)} (upload failed)")
+                        continue
+                    if not stat_matches(path, action.local.size, action.local.mtime_ns):
+                        unconfirmed.add(action.rel)
+                        outcome.skipped.append(f"{show(path)} (changed during the upload; will be uploaded again)")
+                        continue
+                    digest = sha1_of(path)
+                    confirmed[action.rel] = {"type": "file", "size": action.local.size,
+                                             "mtime_ns": action.local.mtime_ns, "sha1": digest}
+                    outcome.uploaded += 1
+                    outcome.add({"op": "upload_new" if action.new else "upload_version",
+                                            "remote": rpath(action.rel), "sha1": digest})
 
-    # Deletions, to Drive's trash. The IDs are recorded for undo.
-    trash_actions = [a for a in actions if a.op == "trash_remote"]
-    trashed = set()
-    if trash_actions:
-        targets = {rpath(a.rel): a for a in trash_actions}
+        # Deletions, to Drive's trash. The IDs are recorded for undo.
+        trash_actions = [a for a in actions if a.op == "trash_remote"]
+        if trash_actions:
+            targets = {rpath(a.rel): a for a in trash_actions}
 
-        def uid_for(item):
-            path, action = item
-            if action.remote is not None:
-                return path, action.remote.uid
-            node = drive.info(path)
-            return path, node.get("uid") if node else None
+            def uid_for(item):
+                path, action = item
+                if action.remote is not None:
+                    return path, action.remote.uid
+                node = drive.info(path)
+                return path, node.get("uid") if node else None
 
-        with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
-            uids = dict(pool.map(uid_for, targets.items()))
-        existing = {f"{DRIVE_ROOT}/{uids[p]}": p for p in targets if uids.get(p)}
-        failed = set(drive.trash(list(existing)))
-        for path, action in targets.items():
-            uid = uids.get(path)
-            if uid and f"{DRIVE_ROOT}/{uid}" in failed:
-                outcome.failed.append(f"{path} on Drive (couldn't be moved to the trash)")
-                continue
-            trashed.add(action.rel)
-            if uid:
-                outcome.trashed_remote += action.count
-                outcome.journal.append({"op": "trash_remote", "remote": path, "uid": uid,
-                                        "name": os.path.basename(action.rel)})
-
-    # The new record of what is on Drive.
-    new = {}
-    for rel, item in scan.entries.items():
-        if rel in confirmed:
-            new[rel] = confirmed[rel]
-        elif rel in manifest:
-            new[rel] = {"type": "dir"} if item.type == "dir" else manifest[rel]
-    for rel, record in manifest.items():
-        if rel in new or any(is_under(rel, t) for t in trashed):
-            continue
-        if any(is_under(rel, bad) or is_under(bad, rel) for bad in scan.unreadable):
-            new[rel] = record
-    save_state(entry, new)
+            with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
+                uids = dict(pool.map(uid_for, targets.items()))
+            existing = {f"{DRIVE_ROOT}/{uids[p]}": p for p in targets if uids.get(p)}
+            failed = set(drive.trash(list(existing)))
+            for path, action in targets.items():
+                uid = uids.get(path)
+                if uid and f"{DRIVE_ROOT}/{uid}" in failed:
+                    outcome.failed.append(f"{path} on Drive (couldn't be moved to the trash)")
+                    continue
+                trashed.add(action.rel)
+                if uid:
+                    outcome.trashed_remote += action.count
+                    outcome.add({"op": "trash_remote", "remote": path, "uid": uid,
+                                            "name": os.path.basename(action.rel)})
+    except BaseException:
+        save_manifest()
+        raise
+    save_manifest()
 
 
 def run_sync(plan, config, drive, outcome):
@@ -1327,191 +1370,195 @@ def run_sync(plan, config, drive, outcome):
             del new_state[key]
         written.add(rel)
 
-    # 1. Folders.
-    if any(a.op == "mkdir_remote" and a.rel == "" for a in actions):
-        drive.mkdirs(entry.remote)
-    for action in sorted((a for a in actions if a.op == "mkdir_remote" and a.rel), key=lambda a: a.rel.count("/")):
-        if drive.info(rpath(action.rel)) is None:
-            drive.create_folder(rpath(parent_rel(action.rel)), os.path.basename(action.rel))
-            outcome.journal.append({"op": "mkdir_remote", "remote": rpath(action.rel)})
-        remember(action.rel, {"type": "dir"})
-    for action in sorted((a for a in actions if a.op == "mkdir_local"), key=lambda a: a.rel.count("/")):
-        if not os.path.isdir(lpath(action.rel)):
-            os.makedirs(lpath(action.rel))
-            outcome.journal.append({"op": "mkdir_local", "local": lpath(action.rel)})
-        remember(action.rel, {"type": "dir"})
+    try:
+        # 1. Folders.
+        if any(a.op == "mkdir_remote" and a.rel == "" for a in actions):
+            drive.mkdirs(entry.remote)
+        for action in sorted((a for a in actions if a.op == "mkdir_remote" and a.rel), key=lambda a: a.rel.count("/")):
+            if drive.info(rpath(action.rel)) is None:
+                drive.create_folder(rpath(parent_rel(action.rel)), os.path.basename(action.rel))
+                outcome.add({"op": "mkdir_remote", "remote": rpath(action.rel)})
+            remember(action.rel, {"type": "dir"})
+        for action in sorted((a for a in actions if a.op == "mkdir_local"), key=lambda a: a.rel.count("/")):
+            if not os.path.isdir(lpath(action.rel)):
+                os.makedirs(lpath(action.rel))
+                outcome.add({"op": "mkdir_local", "local": lpath(action.rel)})
+            remember(action.rel, {"type": "dir"})
 
-    # 2. Conflicts: the laptop copy is renamed and uploaded; the Drive copy is downloaded.
-    uploads = [(a.rel, a.local, a.new) for a in actions if a.op == "upload"]
-    downloads = [a for a in actions if a.op == "download"]
-    for action in (a for a in actions if a.op == "conflict"):
-        path = lpath(action.rel)
-        if not stat_matches(path, action.local.size, action.local.mtime_ns):
-            outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
-            continue
-        renamed = conflict_name(path)
-        os.rename(path, renamed)
-        outcome.journal.append({"op": "rename_local", "from": path, "to": renamed})
-        new_rel = os.path.relpath(renamed, base)
-        info = os.stat(renamed)
-        uploads.append((new_rel, Local(new_rel, "file", info.st_size, info.st_mtime_ns), True))
-        downloads.append(Action("download", action.rel, new=True, remote=action.remote))
-        outcome.conflicts += 1
-
-    # 3. Uploads, grouped by Drive folder; whole new folders in one go.
-    groups = {}
-    for rel, item, is_new in uploads:
-        groups.setdefault(parent_rel(rel), []).append(("file", rel, item, is_new))
-    for action in (a for a in actions if a.op == "upload_dir"):
-        groups.setdefault(parent_rel(action.rel), []).append(("dir", action.rel, None, True))
-
-    def do_upload(parent):
-        sources = []
-        for kind, rel, item, is_new in groups[parent]:
-            if kind == "dir":
-                files = {r: e for r, e in scan.entries.items() if is_under(r, rel) and e.type == "file"}
-                sources.append((kind, rel, {r: (e, sha1_of(lpath(r))) for r, e in files.items()}, is_new))
-            elif stat_matches(lpath(rel), item.size, item.mtime_ns):
-                sources.append((kind, rel, (item, sha1_of(lpath(rel))), is_new))
-            else:
-                outcome.skipped.append(f"{show(lpath(rel))} (changed during the run; left for next time)")
-        if not sources:
-            return []
-        ok, failed = drive.upload([lpath(rel) for _, rel, _, _ in sources], rpath(parent))
-        done = []
-        for kind, rel, data, is_new in sources:
-            if kind == "dir" and failed:
-                outcome.failed.append(f"{show(lpath(rel))} (some files failed to upload)")
-            elif kind == "file" and (os.path.basename(rel) in failed or "*" in failed):
-                outcome.failed.append(f"{show(lpath(rel))} (upload failed)")
-            else:
-                done.append((kind, rel, data, is_new))
-        return done
-
-    uploaded = []
-    if groups:
-        with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
-            for done in pool.map(do_upload, list(groups)):
-                uploaded.extend(done)
-    if uploaded:
-        # Learn the new revisions, and check that Drive has what was hashed.
-        folders = sorted({parent_rel(rel) for kind, rel, _, _ in uploaded if kind == "file"})
-        with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
-            listings = dict(zip(folders, pool.map(lambda p: drive.list(rpath(p)), folders)))
-        seen = {}
-        for parent, items in listings.items():
-            for node in items:
-                name = (node.get("name") or {}).get("value")
-                if name:
-                    seen[f"{parent}/{name}" if parent else name] = node
-        trees = {rel: drive.walk(rpath(rel)) for kind, rel, _, _ in uploaded if kind == "dir"}
-        for kind, rel, data, is_new in uploaded:
-            if kind == "dir":
-                remember(rel, {"type": "dir"})
-                tree = trees.get(rel, {})
-                for sub, r in tree.items():
-                    full = f"{rel}/{sub}"
-                    if r.type == "dir":
-                        remember(full, {"type": "dir"})
-                    elif full in data:
-                        item, digest = data[full]
-                        if r.sha1 == digest and stat_matches(lpath(full), item.size, item.mtime_ns):
-                            remember(full, {"type": "file", "size": item.size, "mtime_ns": item.mtime_ns,
-                                            "sha1": digest, "rev": r.rev})
-                outcome.uploaded += len(data)
-                outcome.journal.append({"op": "upload_new", "remote": rpath(rel), "dir": True})
+        # 2. Conflicts: the laptop copy is renamed and uploaded; the Drive copy is downloaded.
+        uploads = [(a.rel, a.local, a.new) for a in actions if a.op == "upload"]
+        downloads = [a for a in actions if a.op == "download"]
+        for action in (a for a in actions if a.op == "conflict"):
+            path = lpath(action.rel)
+            if not stat_matches(path, action.local.size, action.local.mtime_ns):
+                outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
                 continue
-            item, digest = data
-            node = seen.get(rel) or {}
-            rev = node.get("activeRevision") or {}
-            remote_sha1 = ((rev.get("claimedDigests") or {}).get("sha1") or "").lower()
-            outcome.uploaded += 1
-            outcome.journal.append({"op": "upload_new" if is_new else "upload_version",
-                                    "remote": rpath(rel), "sha1": digest})
-            if remote_sha1 == digest and stat_matches(lpath(rel), item.size, item.mtime_ns):
-                remember(rel, {"type": "file", "size": item.size, "mtime_ns": item.mtime_ns,
-                               "sha1": digest, "rev": rev.get("uid", "")})
-            else:
-                # It changed while uploading: forget it, so the next run compares both sides again.
-                forget(rel)
+            renamed = conflict_name(path)
+            os.rename(path, renamed)
+            outcome.add({"op": "rename_local", "from": path, "to": renamed})
+            new_rel = os.path.relpath(renamed, base)
+            info = os.stat(renamed)
+            uploads.append((new_rel, Local(new_rel, "file", info.st_size, info.st_mtime_ns), True))
+            downloads.append(Action("download", action.rel, new=True, remote=action.remote))
+            outcome.conflicts += 1
 
-    # 4. Downloads into a temporary folder inside the pair, then moved into place.
-    dir_downloads = [a for a in actions if a.op == "download_dir"]
-    if downloads or dir_downloads:
-        os.makedirs(tmp_root, exist_ok=True)
-        try:
-            by_parent = {}
-            for action in downloads:
-                by_parent.setdefault(parent_rel(action.rel), []).append(action)
-            for index, (parent, group) in enumerate(sorted(by_parent.items())):
-                staging = os.path.join(tmp_root, f"f{index}")
-                os.makedirs(staging)
-                ok = drive.download([rpath(a.rel) for a in group], staging)
-                for action in group:
-                    place_download(action, os.path.join(staging, os.path.basename(action.rel)),
-                                   lpath(action.rel), outcome, remember, ok)
-            for index, action in enumerate(dir_downloads):
-                staging = os.path.join(tmp_root, f"d{index}")
-                os.makedirs(staging)
-                target = lpath(action.rel)
-                fetched = os.path.join(staging, os.path.basename(action.rel))
-                if not drive.download([rpath(action.rel)], staging) or not os.path.isdir(fetched):
-                    outcome.failed.append(f"{show(target)} (download failed)")
-                    continue
-                if os.path.lexists(target):
-                    outcome.skipped.append(f"{show(target)} (appeared during the run; left for next time)")
-                    continue
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                os.rename(fetched, target)
-                remember(action.rel, {"type": "dir"})
-                count = 0
-                for rel, r in remote.items():
-                    if not is_under(rel, action.rel) or rel == action.rel:
-                        continue
-                    if r.type == "dir":
-                        remember(rel, {"type": "dir"})
-                        continue
-                    path = lpath(rel)
-                    if not os.path.isfile(path):
-                        continue
-                    if r.mtime:
-                        os.utime(path, (r.mtime, r.mtime))
-                    info = os.stat(path)
-                    remember(rel, {"type": "file", "size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                                   "sha1": r.sha1, "rev": r.rev})
-                    count += 1
-                outcome.downloaded += count
-                outcome.journal.append({"op": "download_new", "local": target, "dir": True})
-        finally:
-            shutil.rmtree(tmp_root, ignore_errors=True)
+        # 3. Uploads, grouped by Drive folder; whole new folders in one go.
+        groups = {}
+        for rel, item, is_new in uploads:
+            groups.setdefault(parent_rel(rel), []).append(("file", rel, item, is_new))
+        for action in (a for a in actions if a.op == "upload_dir"):
+            groups.setdefault(parent_rel(action.rel), []).append(("dir", action.rel, None, True))
 
-    # 5. Deletions.
-    remote_trash = [a for a in actions if a.op == "trash_remote"]
-    if remote_trash:
-        paths = [f"{DRIVE_ROOT}/{a.remote.uid}" if a.remote and a.remote.uid else rpath(a.rel) for a in remote_trash]
-        failed = set(drive.trash(paths))
-        for action, path in zip(remote_trash, paths):
-            if path in failed:
-                outcome.failed.append(f"{rpath(action.rel)} on Drive (couldn't be moved to the trash)")
+        def do_upload(parent):
+            sources = []
+            for kind, rel, item, is_new in groups[parent]:
+                if kind == "dir":
+                    files = {r: e for r, e in scan.entries.items() if is_under(r, rel) and e.type == "file"}
+                    sources.append((kind, rel, {r: (e, sha1_of(lpath(r))) for r, e in files.items()}, is_new))
+                elif stat_matches(lpath(rel), item.size, item.mtime_ns):
+                    sources.append((kind, rel, (item, sha1_of(lpath(rel))), is_new))
+                else:
+                    outcome.skipped.append(f"{show(lpath(rel))} (changed during the run; left for next time)")
+            if not sources:
+                return []
+            ok, failed = drive.upload([lpath(rel) for _, rel, _, _ in sources], rpath(parent))
+            done = []
+            for kind, rel, data, is_new in sources:
+                if kind == "dir" and failed:
+                    outcome.failed.append(f"{show(lpath(rel))} (some files failed to upload)")
+                elif kind == "file" and (os.path.basename(rel) in failed or "*" in failed):
+                    outcome.failed.append(f"{show(lpath(rel))} (upload failed)")
+                else:
+                    done.append((kind, rel, data, is_new))
+            return done
+
+        uploaded = []
+        if groups:
+            with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+                for done in pool.map(do_upload, list(groups)):
+                    uploaded.extend(done)
+        if uploaded:
+            # Learn the new revisions, and check that Drive has what was hashed.
+            folders = sorted({parent_rel(rel) for kind, rel, _, _ in uploaded if kind == "file"})
+            with concurrent.futures.ThreadPoolExecutor(LIST_WORKERS) as pool:
+                listings = dict(zip(folders, pool.map(lambda p: drive.list(rpath(p)), folders)))
+            seen = {}
+            for parent, items in listings.items():
+                for node in items:
+                    name = (node.get("name") or {}).get("value")
+                    if name:
+                        seen[f"{parent}/{name}" if parent else name] = node
+            trees = {rel: drive.walk(rpath(rel)) for kind, rel, _, _ in uploaded if kind == "dir"}
+            for kind, rel, data, is_new in uploaded:
+                if kind == "dir":
+                    remember(rel, {"type": "dir"})
+                    tree = trees.get(rel, {})
+                    for sub, r in tree.items():
+                        full = f"{rel}/{sub}"
+                        if r.type == "dir":
+                            remember(full, {"type": "dir"})
+                        elif full in data:
+                            item, digest = data[full]
+                            if r.sha1 == digest and stat_matches(lpath(full), item.size, item.mtime_ns):
+                                remember(full, {"type": "file", "size": item.size, "mtime_ns": item.mtime_ns,
+                                                "sha1": digest, "rev": r.rev})
+                    outcome.uploaded += len(data)
+                    outcome.add({"op": "upload_new", "remote": rpath(rel), "dir": True})
+                    continue
+                item, digest = data
+                node = seen.get(rel) or {}
+                rev = node.get("activeRevision") or {}
+                remote_sha1 = ((rev.get("claimedDigests") or {}).get("sha1") or "").lower()
+                outcome.uploaded += 1
+                outcome.add({"op": "upload_new" if is_new else "upload_version",
+                                        "remote": rpath(rel), "sha1": digest})
+                if remote_sha1 == digest and stat_matches(lpath(rel), item.size, item.mtime_ns):
+                    remember(rel, {"type": "file", "size": item.size, "mtime_ns": item.mtime_ns,
+                                   "sha1": digest, "rev": rev.get("uid", "")})
+                else:
+                    # It changed while uploading: forget it, so the next run compares both sides again.
+                    forget(rel)
+
+        # 4. Downloads into a temporary folder inside the pair, then moved into place.
+        dir_downloads = [a for a in actions if a.op == "download_dir"]
+        if downloads or dir_downloads:
+            os.makedirs(tmp_root, exist_ok=True)
+            try:
+                by_parent = {}
+                for action in downloads:
+                    by_parent.setdefault(parent_rel(action.rel), []).append(action)
+                for index, (parent, group) in enumerate(sorted(by_parent.items())):
+                    staging = os.path.join(tmp_root, f"f{index}")
+                    os.makedirs(staging)
+                    ok = drive.download([rpath(a.rel) for a in group], staging)
+                    for action in group:
+                        place_download(action, os.path.join(staging, os.path.basename(action.rel)),
+                                       lpath(action.rel), outcome, remember, ok)
+                for index, action in enumerate(dir_downloads):
+                    staging = os.path.join(tmp_root, f"d{index}")
+                    os.makedirs(staging)
+                    target = lpath(action.rel)
+                    fetched = os.path.join(staging, os.path.basename(action.rel))
+                    if not drive.download([rpath(action.rel)], staging) or not os.path.isdir(fetched):
+                        outcome.failed.append(f"{show(target)} (download failed)")
+                        continue
+                    if os.path.lexists(target):
+                        outcome.skipped.append(f"{show(target)} (appeared during the run; left for next time)")
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    os.rename(fetched, target)
+                    remember(action.rel, {"type": "dir"})
+                    count = 0
+                    for rel, r in remote.items():
+                        if not is_under(rel, action.rel) or rel == action.rel:
+                            continue
+                        if r.type == "dir":
+                            remember(rel, {"type": "dir"})
+                            continue
+                        path = lpath(rel)
+                        if not os.path.isfile(path):
+                            continue
+                        if r.mtime:
+                            os.utime(path, (r.mtime, r.mtime))
+                        info = os.stat(path)
+                        remember(rel, {"type": "file", "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                                       "sha1": r.sha1, "rev": r.rev})
+                        count += 1
+                    outcome.downloaded += count
+                    outcome.add({"op": "download_new", "local": target, "dir": True})
+            finally:
+                shutil.rmtree(tmp_root, ignore_errors=True)
+
+        # 5. Deletions.
+        remote_trash = [a for a in actions if a.op == "trash_remote"]
+        if remote_trash:
+            paths = [f"{DRIVE_ROOT}/{a.remote.uid}" if a.remote and a.remote.uid else rpath(a.rel) for a in remote_trash]
+            failed = set(drive.trash(paths))
+            for action, path in zip(remote_trash, paths):
+                if path in failed:
+                    outcome.failed.append(f"{rpath(action.rel)} on Drive (couldn't be moved to the trash)")
+                    continue
+                outcome.trashed_remote += action.count
+                outcome.add({"op": "trash_remote", "remote": rpath(action.rel),
+                                        "uid": action.remote.uid if action.remote else "",
+                                        "name": os.path.basename(action.rel)})
+                forget(action.rel)
+        for action in (a for a in actions if a.op == "trash_local"):
+            path = lpath(action.rel)
+            if action.local and action.local.type == "file" and not stat_matches(path, action.local.size, action.local.mtime_ns):
+                outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
                 continue
-            outcome.trashed_remote += action.count
-            outcome.journal.append({"op": "trash_remote", "remote": rpath(action.rel),
-                                    "uid": action.remote.uid if action.remote else "",
-                                    "name": os.path.basename(action.rel)})
+            try:
+                record = trash_local(path)
+            except OSError as error:
+                outcome.failed.append(f"{show(path)} (couldn't be moved to the trash: {error.strerror})")
+                continue
+            outcome.trashed_local += action.count
+            outcome.add({"op": "trash_local", "local": path, "trashed": record})
             forget(action.rel)
-    for action in (a for a in actions if a.op == "trash_local"):
-        path = lpath(action.rel)
-        if action.local and action.local.type == "file" and not stat_matches(path, action.local.size, action.local.mtime_ns):
-            outcome.skipped.append(f"{show(path)} (changed during the run; left for next time)")
-            continue
-        try:
-            record = trash_local(path)
-        except OSError as error:
-            outcome.failed.append(f"{show(path)} (couldn't be moved to the trash: {error.strerror})")
-            continue
-        outcome.trashed_local += action.count
-        outcome.journal.append({"op": "trash_local", "local": path, "trashed": record})
-        forget(action.rel)
+    except BaseException:
+        save_state(entry, new_state)
+        raise
 
     # 6. Everything that was already in sync is remembered as it is now.
     for rel, item in scan.entries.items():
@@ -1559,10 +1606,10 @@ def place_download(action, fetched, path, outcome, remember, ok):
     info = os.stat(path)
     outcome.downloaded += 1
     if record:
-        outcome.journal.append({"op": "download_replace", "local": path, "size": info.st_size,
+        outcome.add({"op": "download_replace", "local": path, "size": info.st_size,
                                 "mtime_ns": info.st_mtime_ns, "trashed": record})
     else:
-        outcome.journal.append({"op": "download_new", "local": path, "size": info.st_size,
+        outcome.add({"op": "download_new", "local": path, "size": info.st_size,
                                 "mtime_ns": info.st_mtime_ns})
     rel = action.rel
     remember(rel, {"type": "file", "size": info.st_size, "mtime_ns": info.st_mtime_ns, "sha1": r.sha1, "rev": r.rev})
@@ -1588,6 +1635,34 @@ def conflict_name(path):
 # --------------------------------------------------------------------------------------------
 
 
+def journal_path(entry):
+    return run_path(entry)[:-5] + ".journal"
+
+
+def load_journal(entry, record):
+    if "journal" in record:
+        return record["journal"]
+    items = []
+    try:
+        with open(journal_path(entry)) as handle:
+            for line in handle:
+                try:
+                    items.append(json.loads(line))
+                except ValueError:
+                    break   # a line cut short by a crash
+    except OSError:
+        pass
+    return items
+
+
+def start_record(entry, started, outcome, prev_state):
+    """Before a run changes anything: an empty journal and a "running" record."""
+    os.makedirs(os.path.dirname(run_path(entry)), exist_ok=True)
+    open(journal_path(entry), "w").close()
+    outcome.journal_path = journal_path(entry)
+    write_record(entry, "running", started, outcome, None, prev_state)
+
+
 def write_record(entry, result, started, outcome, drive, prev_state, message=""):
     log_path = run_path(entry)[:-5] + ".log"
     atomic_write(log_path, "\n".join(drive.log) if drive else message)
@@ -1605,7 +1680,7 @@ def write_record(entry, result, started, outcome, drive, prev_state, message="")
         "conflicts": outcome.conflicts,
         "skipped": outcome.skipped,
         "failed": outcome.failed,
-        "journal": outcome.journal,
+        "actions": len(outcome.journal),
         "prev_state": prev_state,
         "undone": False,
     }
@@ -1723,10 +1798,16 @@ def cmd_run(kind, paths, yes):
             prev = load_state(entry)
             outcome = Outcome()
             entry_drive = Drive()
+            start_record(entry, started, outcome, prev)
             try:
                 (run_backup if kind == "backup" else run_sync)(plan, config, entry_drive, outcome)
             except EzError as error:
                 write_record(entry, "failed", started, outcome, entry_drive, prev, str(error))
+                raise
+            except Interrupted:
+                write_record(entry, "interrupted", started, outcome, entry_drive, prev,
+                             "interrupted (Ctrl-C or shutdown); what finished is saved")
+                print(f"{RED}{kind} {show(entry.local)}: interrupted{RESET}  {describe(outcome, kind)} before it stopped")
                 raise
             result = "partial" if outcome.partial else "success"
             write_record(entry, result, started, outcome, entry_drive, prev)
@@ -1888,9 +1969,13 @@ def cmd_last(kind, paths, show_log):
         if not record:
             print(f"{title}: never run\n")
             continue
-        colour = {"success": GREEN, "partial": YELLOW}.get(record["result"], RED)
+        result = record["result"]
+        if result == "running":
+            result = "running now" if lock_is_held() else "didn't finish (ezproton was stopped)"
+        colour = {"success": GREEN, "partial": YELLOW, "running now": YELLOW}.get(result, RED)
         took = record["finished"] - record["started"]
-        print(f"{title}: {colour}{record['result']}{RESET}, {when(record['started'])}, took {int(took)} s"
+        print(f"{title}: {colour}{result}{RESET}, {when(record['started'])}"
+              + (f", took {int(took)} s" if record["result"] != "running" else "")
               + ("  (undone)" if record.get("undone") else ""))
         if record.get("message"):
             print(f"  {record['message']}")
@@ -1913,14 +1998,16 @@ def cmd_undo(kind, paths, yes):
     records = []
     for entry in backups + pairs:
         record = read_json(run_path(entry), None)
-        if record and not record.get("undone") and record.get("journal") is not None:
-            records.append((entry, record))
+        if record and not record.get("undone"):
+            journal = load_journal(entry, record)
+            if journal or record.get("result") in ("success", "partial", "interrupted", "running"):
+                records.append((entry, record, journal))
     if not records:
         raise EzError("there's no run to undo (each run can be undone once).")
     print("Undo will reverse:")
-    for entry, record in records:
+    for entry, record, journal in records:
         print(f"  {entry.kind} {show(entry.local)}  (run of {when(record['started'])}, "
-              f"{plural(len(record['journal']), 'action')})")
+              f"{plural(len(journal), 'action')})")
     if not yes:
         if not sys.stdin.isatty():
             raise EzError("undo needs confirmation: run it in a terminal, or add --yes.")
@@ -1931,8 +2018,8 @@ def cmd_undo(kind, paths, yes):
         drive = Drive()
         drive.check_login()
         worst = OK
-        for entry, record in records:
-            leftovers = undo_record(entry, record, drive)
+        for entry, record, journal in records:
+            leftovers = undo_record(entry, record, journal, drive)
             record["undone"] = True
             atomic_write(run_path(entry), json.dumps(record))
             if record.get("prev_state") is None:
@@ -1952,10 +2039,10 @@ def cmd_undo(kind, paths, yes):
         return worst
 
 
-def undo_record(entry, record, drive):
+def undo_record(entry, record, journal, drive):
     leftovers = []
     trash_cache = {}
-    for item in reversed(record["journal"]):
+    for item in reversed(journal):
         op = item["op"]
         try:
             if op == "upload_new":
@@ -1984,7 +2071,7 @@ def undo_record(entry, record, drive):
                 if not os.path.lexists(path):
                     continue
                 newer = [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs
-                         if os.lstat(os.path.join(d, f)).st_mtime > record["finished"]]
+                         if os.lstat(os.path.join(d, f)).st_mtime > record.get("finished", time.time())]
                 if newer:
                     leftovers.append(f"{show(path)} has files changed since the run; left as it is")
                     continue
@@ -2241,8 +2328,15 @@ def main(argv):
 
 
 def entry_point():
+    import signal
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
     try:
         sys.exit(main(sys.argv[1:]))
+    except Interrupted:
+        print(f"\n{RED}ezproton: interrupted. What finished is saved: see \"ezproton last\".{RESET}",
+              file=sys.stderr)
+        sys.exit(INTERRUPTED)
     except UsageError as error:
         print(f"ezproton: {error}", file=sys.stderr)
         print("Run \"ezproton --help\" for the commands.", file=sys.stderr)
@@ -2252,7 +2346,7 @@ def entry_point():
         sys.exit(error.code)
     except KeyboardInterrupt:
         print("\nezproton: interrupted.", file=sys.stderr)
-        sys.exit(ERROR)
+        sys.exit(INTERRUPTED)
 
 
 if __name__ == "__main__":

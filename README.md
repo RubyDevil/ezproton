@@ -333,6 +333,10 @@ and checks it before restoring:
 - **The login is checked first,** so a logged-out or offline run fails before doing anything.
 - **One run at a time:** a second ezproton run while one is working stops right away.
 - **Files changed during a run** (between scanning and transferring) are left for the next run.
+- **Interrupted runs:** on Ctrl-C or shutdown, ezproton abandons the current transfer and saves
+  what it finished, so `last` shows the run as interrupted and `undo last` can reverse it. Even if
+  ezproton is killed outright, each finished action is already on disk. A second Ctrl-C quits at
+  once.
 - **Partial runs:** if some files fail, the rest still go through. The failures are reported, and
   nothing is deleted because of them.
 
@@ -344,6 +348,7 @@ and checks it before restoring:
 | 1 | Error or usage error. Nothing was changed, or the run stopped early. |
 | 2 | Partial: some files were skipped or failed, or an undo left items for you to finish |
 | 3 | Stopped by the deletion limit. Repeat with `--yes` to go ahead. |
+| 130 | Interrupted (Ctrl-C, or the system shutting down). What finished is saved. |
 
 ---
 
