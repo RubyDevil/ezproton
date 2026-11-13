@@ -13,9 +13,6 @@ drive.proton.me or in Proton's apps. Anything ezproton removes goes to a trash (
 your desktop trash), never straight to permanent deletion.
 
 > **Unofficial.** ezproton is not made by or affiliated with Proton.
->
-> **Status: specification.** This README describes how ezproton will work. It is written before
-> the code, and the code is built and tested against it.
 
 ---
 
@@ -57,6 +54,8 @@ prints how to remove those too.
 
 ### Requirements
 
+- Proton's `proton-drive` command-line tool. The installer installs it. ezproton is tested with
+  `proton-drive` 0.9.0.
 - Linux with Python 3.9 or newer. Every current desktop distribution has it, and ezproton uses
   only Python's built-in modules.
 - Standard command-line tools (coreutils), and `curl` for the installer.
@@ -102,11 +101,11 @@ else.
 |---|---|
 | `backup` | Runs the backup. |
 | `sync` | Runs the sync. |
-| `check` | Shows what's set up, and changes nothing. One line per backup folder: whether it exists, file count, size, excluded paths, its Drive folder, and the last backup. One line per sync pair: both folders, whether each exists, and the last sync. Before those it shows the login status and any config problems. |
-| `preview` | A dry run. Lists exactly what `backup` or `sync` would do: uploads, downloads, conflicts, and what would go to which trash. Warns if the deletion limit would be hit. `--excluded` also lists every skipped path and why. |
+| `check` | Shows what's set up, and changes nothing. One line per backup folder: whether it exists, file count, size, excluded paths, its Drive folder, and the last backup. One line per sync pair: both folders, whether each exists, and the last sync. Before those it shows the login status and any config problems. It exits with 1 when it finds a problem (such as a missing folder), so scripts can rely on it. |
+| `preview` | A dry run. It reads Drive but changes nothing. Lists exactly what `backup` or `sync` would do: uploads, downloads, conflicts, and what would go to which trash. Warns if the deletion limit would be hit. `--excluded` also lists every skipped path and why. |
 | `last` | How the last run went for each folder or pair: the result, when, how long, what was transferred, and what was skipped. `--log` prints the full output of that run. |
-| `undo last` | Reverses the last run, as far as possible (see [Undo](#undo)). It shows what it will do and asks first, unless `--yes` is given. |
-| `edit` | Opens a config file in a terminal editor (see [Editing the config](#editing-the-config)). With no file named, it shows a short menu. |
+| `undo last` | Reverses the last run, as far as possible (see [Undo](#undo)). It shows what it will do and asks first, unless `--yes` is given. Without a terminal to ask in, `--yes` is required. |
+| `edit` | Opens a config file in a terminal editor (see [Editing the config](#editing-the-config)). With no file named, it shows a short menu (in a terminal). |
 
 **`PATH` arguments** must match a configured backup folder, or the laptop folder of a sync pair.
 Relative paths work and are resolved from the current folder, so `cd ~/Music && ezproton sync .`
@@ -217,7 +216,7 @@ A run stops before changing anything if:
 A missing file is created with a commented example. You edit a temporary copy. When the editor
 closes, the copy is checked against the rules above. If there are problems, ezproton lists them
 and asks: **e**dit again, **k**eep anyway, or **d**iscard. The real file only changes once you
-accept.
+accept. Without a terminal to ask in, a file with problems is not saved.
 
 ---
 
@@ -278,7 +277,7 @@ the laptop and Drive against that memory:
 sync pair it covers, using the record that run left in `~/.local/state/ezproton/`.
 
 - It lists what it will do and asks before starting. `--yes` skips the question, but not the
-  prompts described below.
+  prompts described below. Without a terminal to ask in, `--yes` is required.
 - A run can be undone once. An undo can't be undone.
 - **Anything changed since the run is left alone.** If you edited a downloaded file afterwards, or
   a newer run already touched a file, that item is skipped and reported. Undo never throws away

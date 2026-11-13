@@ -1072,6 +1072,40 @@ class EditTests(EzTestCase):
 
 
 # --------------------------------------------------------------------------------------------
+# README (issue #2)
+# --------------------------------------------------------------------------------------------
+
+
+class ReadmeTests(EzTestCase):
+    def readme(self):
+        return (HERE.parent / "README.md").read_text()
+
+    def test_readme_is_no_longer_a_specification(self):
+        text = self.readme().lower()
+        self.assertNotIn("status: specification", text)
+        self.assertNotIn("written before the code", text)
+
+    def test_readme_names_the_tested_proton_drive_version(self):
+        self.assertRegex(self.readme(), r"(?i)tested with[^\n]*0\.9\.0|0\.9\.0[^\n]*tested")
+
+    def test_readme_covers_every_command_and_option_in_the_help(self):
+        help_text, readme = self.ok("--help").stdout, self.readme()
+        commands = set(re.findall(r"^  ezproton (\w+)", help_text, re.M))
+        options = set(re.findall(r"(--[a-z][a-z-]+)", help_text))
+        self.assertTrue(commands and options)
+        for word in sorted(commands):
+            self.assertIn(f"ezproton {word}", readme)
+        for option in sorted(options):
+            self.assertIn(option, readme)
+
+    def test_readme_documents_behaviour_without_a_terminal(self):
+        readme = self.readme()
+        self.assertRegex(readme, r"(?s)`check`.{0,600}exits with 1")
+        self.assertRegex(readme, r"(?s)Without a terminal.{0,200}`--yes`")
+        self.assertRegex(readme, r"(?s)Without a terminal.{0,200}not saved")
+
+
+# --------------------------------------------------------------------------------------------
 # The fake proton-drive
 # --------------------------------------------------------------------------------------------
 
