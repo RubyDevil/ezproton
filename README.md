@@ -390,6 +390,9 @@ A run stopped by the deletion limit exits with code 3 and waits for you to run i
 - **Speed:** listing a Drive folder takes about 3 seconds, so ezproton lists many folders in
   parallel. Large libraries still take a while on the first sync, and the first upload of video
   and music collections takes as long as your connection needs.
+- **No time limit on transfers:** uploads and downloads take as long as your connection needs.
+  Quick calls to `proton-drive` (listing, checking, trashing) count as hung after 300 seconds;
+  change that with the `EZPROTON_CALL_TIMEOUT` environment variable.
 - **Not kept:** permissions, ownership and symlinks. This is a file backup, not a system image.
 - **The Proton login** in your keyring can reach your whole Drive, and so can anything running as
   your user. Revoke it with `proton-drive auth logout`, or in your Proton account's session list.

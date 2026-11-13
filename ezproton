@@ -75,12 +75,17 @@ Exit status:
   3 stopped by the deletion limit (repeat with --yes)
 
 Environment:
-  NO_COLOR    Set to disable colors"""
+  NO_COLOR               Set to disable colors
+  EZPROTON_CALL_TIMEOUT  Seconds before a quick proton-drive call (not an upload
+                         or download) counts as hung (default 300)"""
 
 DRIVE_ROOT = "/my-files"
 TMP_NAME = ".ezproton-tmp"
 UPLOAD_WORKERS = 4
 LIST_WORKERS = 8
+# Quick proton-drive calls (info, list, trash...) that take longer than this count as hung.
+# Transfers (upload, download) have no limit: they take as long as the connection needs.
+CALL_TIMEOUT = float(os.environ.get("EZPROTON_CALL_TIMEOUT") or 300)
 HOSTNAME = os.uname().nodename
 
 HOME = os.path.expanduser("~")
@@ -523,7 +528,7 @@ class Drive:
     def __init__(self):
         self.log = []
 
-    def run(self, *args, timeout=3600):
+    def run(self, *args, timeout=CALL_TIMEOUT):
         try:
             result = subprocess.run(
                 ["proton-drive", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout
@@ -532,7 +537,8 @@ class Drive:
             raise DriveError("proton-drive is not installed. Install it with ezproton's install.sh, "
                              "or from https://proton.me/download/drive/cli")
         except subprocess.TimeoutExpired:
-            raise DriveError(f"proton-drive {' '.join(args[:2])} timed out")
+            raise DriveError(f"proton-drive {' '.join(args[:2])} timed out after {timeout:g} s "
+                             "(check the internet connection)")
         self.log.append(f"$ proton-drive {shlex.join(args)}\n{result.stdout}{result.stderr}")
         return result
 
@@ -542,7 +548,7 @@ class Drive:
         return "not found" in text.lower()
 
     def check_login(self):
-        result = self.run("filesystem", "info", "--json", DRIVE_ROOT, timeout=120)
+        result = self.run("filesystem", "info", "--json", DRIVE_ROOT)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise DriveError(
@@ -552,7 +558,7 @@ class Drive:
             )
 
     def info(self, path):
-        result = self.run("filesystem", "info", "--json", path, timeout=300)
+        result = self.run("filesystem", "info", "--json", path)
         if result.returncode != 0:
             if self.not_found(result):
                 return None
@@ -563,7 +569,7 @@ class Drive:
             raise DriveError(f"unexpected output from proton-drive info {path}")
 
     def list(self, path):
-        result = self.run("filesystem", "list", "--json", path, timeout=600)
+        result = self.run("filesystem", "list", "--json", path)
         if result.returncode != 0:
             raise DriveError(f"can't list {path} on Drive: {(result.stderr or result.stdout).strip()}")
         try:
@@ -572,7 +578,7 @@ class Drive:
             raise DriveError(f"unexpected output from proton-drive list {path}")
 
     def create_folder(self, parent, name):
-        result = self.run("filesystem", "create-folder", parent, name, timeout=300)
+        result = self.run("filesystem", "create-folder", parent, name)
         if result.returncode != 0 and "already exists" not in (result.stdout + result.stderr):
             raise DriveError(f"can't create {drive_join(parent, name)} on Drive: {(result.stderr or result.stdout).strip()}")
 
@@ -592,7 +598,7 @@ class Drive:
     def upload(self, sources, parent):
         """Upload local files or folders into a Drive folder. Returns (ok, failed names)."""
         result = self.run("filesystem", "upload", "--file-conflict-strategy", "create-new-revision",
-                          "--folder-conflict-strategy", "merge", *sources, parent)
+                          "--folder-conflict-strategy", "merge", *sources, parent, timeout=None)
         failed = set()
         in_failed = False
         for line in result.stdout.splitlines():
@@ -606,7 +612,8 @@ class Drive:
         return result.returncode == 0, failed
 
     def download(self, sources, folder):
-        result = self.run("filesystem", "download", "--file-conflict-strategy", "remove", *sources, folder)
+        result = self.run("filesystem", "download", "--file-conflict-strategy", "remove", *sources, folder,
+                          timeout=None)
         return result.returncode == 0
 
     def trash(self, paths):

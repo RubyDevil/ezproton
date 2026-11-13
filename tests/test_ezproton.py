@@ -775,6 +775,37 @@ class SyncTests(EzTestCase):
 
 
 # --------------------------------------------------------------------------------------------
+# Time limits (issue #1)
+# --------------------------------------------------------------------------------------------
+
+
+class TimeoutTests(EzTestCase):
+    """EZPROTON_CALL_TIMEOUT lowers the limit for quick calls, so the tests don't wait for long."""
+
+    def test_uploads_have_no_time_limit(self):
+        self.backup("~/Documents")
+        self.mkfile("Documents/a.txt", "A")
+        self.ok("backup", env={"EZPROTON_CALL_TIMEOUT": "1", "FAKE_PD_SLOW": "upload=2.5"})
+        self.assertEqual(self.drive_read(f"{BACKUP_ROOT}/Documents/a.txt"), "A")
+
+    def test_downloads_have_no_time_limit(self):
+        self.sync("~/Music : /my-files/Music")
+        (self.home / "Music").mkdir()
+        self.drive_put("/my-files/Music/a.mp3", "A")
+        self.ok("sync", env={"EZPROTON_CALL_TIMEOUT": "1", "FAKE_PD_SLOW": "download=2.5"})
+        self.assertEqual(self.read("Music/a.mp3"), "A")
+
+    def test_a_hung_quick_call_times_out(self):
+        self.backup("~/Documents")
+        self.mkfile("Documents/a.txt")
+        started = time.time()
+        result = self.run_ez("backup", env={"EZPROTON_CALL_TIMEOUT": "1", "FAKE_PD_SLOW": "info=5"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("timed out", result.stderr)
+        self.assertLess(time.time() - started, 4.5)
+
+
+# --------------------------------------------------------------------------------------------
 # check, preview, last
 # --------------------------------------------------------------------------------------------
 
@@ -1240,6 +1271,10 @@ def fake_main(argv):
     hook = os.environ.get("FAKE_PD_HOOK")
     if hook:
         subprocess.run(["sh", "-c", hook, "hook", *argv])
+    for rule in filter(None, os.environ.get("FAKE_PD_SLOW", "").split(",")):
+        command, _, seconds = rule.partition("=")
+        if argv[1:2] == [command] or argv[:1] == [command]:
+            time.sleep(float(seconds))
     if os.environ.get("FAKE_PD_OFFLINE"):
         print("Error: fetch failed (network unreachable)", file=sys.stderr)
         return 1
