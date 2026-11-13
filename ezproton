@@ -968,6 +968,27 @@ def scan_local(root, config, single_file=False):
     return scan
 
 
+def folder_size(path):
+    total = 0
+    for folder, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(folder, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def remove_leftover_tmp(pair):
+    """A sync that crashed leaves its temporary download folder behind. Only call this while
+    holding the run lock, so it can't belong to a run that's still going."""
+    path = os.path.join(pair.local, TMP_NAME)
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, ignore_errors=True)
+        return True
+    return False
+
+
 def stat_matches(path, size, mtime_ns):
     try:
         info = os.stat(path, follow_symlinks=False)
@@ -2033,6 +2054,11 @@ def cmd_run(kind, paths, yes):
     with Lock():
         drive = Drive()
         preflight(config, backups if kind == "backup" else [], pairs if kind == "sync" else [], drive, True)
+        if kind == "sync":
+            for pair in entries:
+                if remove_leftover_tmp(pair):
+                    warn(f"Removed a temporary folder left by an earlier sync that didn't finish: "
+                         f"{show(os.path.join(pair.local, TMP_NAME))}")
         plans = []
         for entry in entries:
             PROGRESS.header(f"{kind} {show(entry.local)}  →  {entry.remote}: checking")
@@ -2149,6 +2175,10 @@ def cmd_check(kind, paths):
             state = "?" if not online else ("exists" if remote_exists.get(pair.remote) else "not created yet")
             print(f"  {show(pair.local):<30} {'exists' if local_ok else RED + 'missing' + RESET}")
             print(f"  {'':<30} {DIM}: {pair.remote} ({state})   last: {last_line(pair)}{RESET}")
+            leftover = os.path.join(pair.local, TMP_NAME)
+            if os.path.isdir(leftover) and not lock_is_held():
+                print(f"  {'':<30} {YELLOW}{TMP_NAME} left by a sync that didn't finish "
+                      f"({human(folder_size(leftover))}); the next sync removes it{RESET}")
         print()
     if problems:
         print(f"{RED}Problems:{RESET}")

@@ -1212,6 +1212,35 @@ class ProgressTests(EzTestCase):
 
 
 # --------------------------------------------------------------------------------------------
+# Leftover temporary folder (issue #5)
+# --------------------------------------------------------------------------------------------
+
+
+class LeftoverTests(EzTestCase):
+    def setUp(self):
+        super().setUp()
+        self.sync("~/Music : /my-files/Music")
+        self.mkfile("Music/a.mp3", "A")
+        self.ok("sync")
+        # What a crashed sync leaves behind: a partial download in .ezproton-tmp.
+        self.mkfile("Music/.ezproton-tmp/f0/partial.mp3", "p" * 5000)
+
+    def test_next_sync_removes_a_leftover_temp_folder(self):
+        self.ok("sync")
+        self.assertFalse((self.home / "Music/.ezproton-tmp").exists())
+        with self.drive() as d:
+            names = [n["name"] for n in d.nodes()]
+        self.assertNotIn("partial.mp3", names)
+        self.assertNotIn(".ezproton-tmp", names)
+
+    def test_check_mentions_a_leftover_temp_folder(self):
+        out = self.ok("check").stdout
+        self.assertIn(".ezproton-tmp", out)
+        self.assertRegex(out, r"4\.9 KiB|5\.0 KiB|5000 B")
+        self.assertTrue((self.home / "Music/.ezproton-tmp").exists())
+
+
+# --------------------------------------------------------------------------------------------
 # README (issue #2)
 # --------------------------------------------------------------------------------------------
 

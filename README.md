@@ -348,6 +348,9 @@ and checks it before restoring:
   stops before changing anything. Run `ezproton preview` to see the list, then repeat with `--yes`.
 - **The login is checked first,** so a logged-out or offline run fails before doing anything.
 - **One run at a time:** a second ezproton run while one is working stops right away.
+- **Temporary files:** sync downloads into a hidden `.ezproton-tmp` folder inside the pair, then
+  moves each file into place. If a sync is killed before it can clean up, the next sync removes
+  the leftover folder, and `check` points it out in the meantime.
 - **Files changed during a run** (between scanning and transferring) are left for the next run.
 - **Interrupted runs:** on Ctrl-C or shutdown, ezproton abandons the current transfer and saves
   what it finished, so `last` shows the run as interrupted and `undo last` can reverse it. Even if
